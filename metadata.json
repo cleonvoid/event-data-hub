@@ -1,0 +1,6 @@
+{
+  "name": "Event Data Hub",
+  "description": "Hệ thống chuẩn hóa dữ liệu sự kiện và hợp nhất thực thể (Entity Resolution) sử dụng Gemini AI và Vector Search.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
