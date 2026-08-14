@@ -1,10 +1,19 @@
 import { Type } from "@google/genai";
 import { config } from "../config.js";
-import { getTextClient, parseJsonResponse, withRetry, isRateLimitCooldownActive } from "./client.js";
+import { getTextClient, parseJsonResponse, withRetry } from "./client.js";
 import { CANONICAL_FIELDS, type CanonicalField, type FieldMappingDetail, isCanonicalField } from "../types.js";
 import { SEARCH_COLUMN_IDS, SEARCH_OPERATOR_IDS, type SearchColumnId, type SearchOperatorId } from "../search-schema.js";
 
+/**
+ * All three Gemini reasoning steps. Every one of them uses responseSchema
+ * (structured output), not prose scraping, and every one of them re-validates
+ * the model's output server-side afterwards — the schema constrains shape, but
+ * we still treat the values as untrusted input.
+ */
+
 const GEN_CONFIG = {
+  // Near-deterministic: these are classification/extraction tasks, not creative
+  // ones, and a demo that returns different answers each run is not debuggable.
   temperature: 0.1,
 };
 
@@ -12,6 +21,13 @@ const GEN_CONFIG = {
 // 1. Schema inference
 // ---------------------------------------------------------------------------
 
+/**
+ * Returned as an ARRAY rather than an object keyed by column name. Gemini's
+ * responseSchema follows the OpenAPI subset, which cannot express "object with
+ * arbitrary string keys" — the earlier version declared `mappings` as a bare
+ * Type.OBJECT with no properties, which constrained nothing at all. An array of
+ * records with an enum-constrained canonical_field is genuinely enforced.
+ */
 const SCHEMA_MAPPING_RESPONSE = {
   type: Type.OBJECT,
   properties: {
@@ -32,43 +48,10 @@ const SCHEMA_MAPPING_RESPONSE = {
   required: ["mappings"],
 };
 
-function heuristicInferSchemaMapping(headers: string[]): Record<string, FieldMappingDetail> {
-  const result: Record<string, FieldMappingDetail> = {};
-  for (const h of headers) {
-    const norm = h.toLowerCase().trim();
-    if (/^(stt|no\.?|#|id|index)$/i.test(norm)) {
-      result[h] = { canonical_field: "ignore", confidence: 0.99, reasoning: "Cột số thứ tự / mã định danh kỹ thuật" };
-    } else if (/email|mail|thư điện tử/i.test(norm)) {
-      result[h] = { canonical_field: "email", confidence: 0.95, reasoning: "Phát hiện địa chỉ email" };
-    } else if (/phone|tel|mobile|điện thoại|dien thoai|sđt|sdt/i.test(norm)) {
-      result[h] = { canonical_field: "phone", confidence: 0.95, reasoning: "Phát hiện số điện thoại" };
-    } else if (/họ và tên|họ tên|ho ten|full name|name|tên/i.test(norm)) {
-      result[h] = { canonical_field: "full_name", confidence: 0.95, reasoning: "Phát hiện họ và tên" };
-    } else if (/công ty|cong ty|đơn vị|don vi|organization|company|tổ chức|viện|trường/i.test(norm)) {
-      result[h] = { canonical_field: "organization", confidence: 0.9, reasoning: "Phát hiện cơ quan / đơn vị công tác" };
-    } else if (/chức danh|chuc danh|chức vụ|role|title|job|vị trí/i.test(norm)) {
-      result[h] = { canonical_field: "role_title", confidence: 0.9, reasoning: "Phát hiện chức danh / vai trò" };
-    } else if (/sự kiện|su kien|event|hội thảo|hoi thao/i.test(norm)) {
-      result[h] = { canonical_field: "event_name", confidence: 0.9, reasoning: "Phát hiện tên sự kiện" };
-    } else if (/ngày|ngay|date|thời gian|thoi gian|time/i.test(norm)) {
-      result[h] = { canonical_field: "event_date", confidence: 0.9, reasoning: "Phát hiện ngày tổ chức sự kiện" };
-    } else if (/ghi chú|ghi chu|note|notes|thông tin khác/i.test(norm)) {
-      result[h] = { canonical_field: "notes", confidence: 0.85, reasoning: "Phát hiện thông tin ghi chú" };
-    } else {
-      result[h] = { canonical_field: "ignore", confidence: 0.5, reasoning: "Chưa rõ mục đích cột" };
-    }
-  }
-  return result;
-}
-
 export async function inferSchemaMapping(
   headers: string[],
   sampleRows: unknown[][],
 ): Promise<Record<string, FieldMappingDetail>> {
-  if (!process.env.GEMINI_API_KEY || isRateLimitCooldownActive()) {
-    return heuristicInferSchemaMapping(headers);
-  }
-
   const prompt = `Bạn là chuyên gia chuẩn hóa dữ liệu sự kiện của một trung tâm đổi mới sáng tạo Việt Nam.
 
 Nhiệm vụ: ánh xạ MỖI cột nguồn dưới đây sang đúng MỘT trường chuẩn.
@@ -84,76 +67,66 @@ Các trường chuẩn cho phép:
 - "notes": ghi chú, thông tin bổ sung không thuộc các nhóm trên
 - "ignore": cột vô nghĩa (số thứ tự, cột trống, cột kỹ thuật)
 
+Quy tắc quan trọng:
+1. Dùng CẢ tên cột VÀ dữ liệu mẫu để quyết định. Tên cột tiếng Việt thường viết tắt hoặc không dấu.
+2. Cột số thứ tự ("STT", "No.", "#") luôn là "ignore".
+3. Nếu nhiều cột cùng ánh xạ vào một trường, vẫn ánh xạ bình thường — người dùng sẽ tự điều chỉnh.
+4. confidence phản ánh mức chắc chắn thật: đặt thấp (< 0.6) khi bạn phải đoán.
+5. Trả về đúng ${headers.length} phần tử, mỗi cột nguồn một phần tử, theo thứ tự đã cho.
+
 Tên các cột nguồn: ${JSON.stringify(headers)}
-Dữ liệu mẫu: ${JSON.stringify(sampleRows.slice(0, 5))}`;
+Dữ liệu mẫu (mỗi mảng là một dòng, cùng thứ tự cột): ${JSON.stringify(sampleRows.slice(0, 5))}`;
 
-  try {
-    const client = getTextClient();
-    const response = await withRetry("inferSchemaMapping", () =>
-      client.models.generateContent({
-        model: config.gemini.model,
-        contents: prompt,
-        config: {
-          ...GEN_CONFIG,
-          responseMimeType: "application/json",
-          responseSchema: SCHEMA_MAPPING_RESPONSE,
-        },
-      }),
-    );
+  const client = getTextClient();
+  const response = await withRetry("inferSchemaMapping", () =>
+    client.models.generateContent({
+      model: config.gemini.model,
+      contents: prompt,
+      config: {
+        ...GEN_CONFIG,
+        responseMimeType: "application/json",
+        responseSchema: SCHEMA_MAPPING_RESPONSE,
+      },
+    }),
+  );
 
-    const parsed = parseJsonResponse<{
-      mappings?: { source_column?: string; canonical_field?: string; confidence?: number; reasoning?: string }[];
-    }>(response.text, "inferSchemaMapping");
+  const parsed = parseJsonResponse<{
+    mappings?: { source_column?: string; canonical_field?: string; confidence?: number; reasoning?: string }[];
+  }>(response.text, "inferSchemaMapping");
 
-    const byColumn = new Map<string, FieldMappingDetail>();
-    for (const m of parsed.mappings ?? []) {
-      const col = typeof m.source_column === "string" ? m.source_column : "";
-      if (!col) continue;
-      const target = isCanonicalField(m.canonical_field) ? m.canonical_field : "ignore";
-      byColumn.set(col, {
-        canonical_field: target,
-        confidence: clamp01(m.confidence),
-        reasoning:
-          typeof m.reasoning === "string" && m.reasoning.trim()
-            ? m.reasoning.trim()
-            : `Ánh xạ sang "${target}".`,
-      });
-    }
-
-    const out: Record<string, FieldMappingDetail> = {};
-    for (const h of headers) {
-      const direct = byColumn.get(h);
-      if (direct) {
-        out[h] = direct;
-        continue;
-      }
-      const fuzzyKey = findFuzzy(byColumn.keys(), h);
-      if (fuzzyKey) {
-        out[h] = byColumn.get(fuzzyKey)!;
-        continue;
-      }
-      out[h] = {
-        canonical_field: "ignore",
-        confidence: 0,
-        reasoning: "Mô hình không trả về ánh xạ cho cột này; mặc định bỏ qua.",
-      };
-    }
-
-    return out;
-  } catch (err) {
-    const reason = (err as Error)?.message || "";
-    if (!/rate limit|cooldown|429|quota/i.test(reason)) {
-      console.warn(`[gemini] inferSchemaMapping failed (${reason.slice(0, 100)}), using heuristic fallback.`);
-    }
-    return heuristicInferSchemaMapping(headers);
+  const byColumn = new Map<string, FieldMappingDetail>();
+  for (const m of parsed.mappings ?? []) {
+    const col = typeof m.source_column === "string" ? m.source_column : "";
+    if (!col) continue;
+    byColumn.set(col, {
+      canonical_field: isCanonicalField(m.canonical_field) ? m.canonical_field : "notes",
+      confidence: clamp01(m.confidence),
+      reasoning: typeof m.reasoning === "string" && m.reasoning ? m.reasoning : "Không có giải thích",
+    });
   }
+
+  // The model can skip or rename a column. Anchor the result to the real header
+  // list so the confirmation UI always shows every column exactly once.
+  const result: Record<string, FieldMappingDetail> = {};
+  for (const h of headers) {
+    result[h] =
+      byColumn.get(h) ??
+      findLoosely(byColumn, h) ?? {
+        canonical_field: "ignore" as CanonicalField,
+        confidence: 0,
+        reasoning: "Mô hình không đề xuất được ánh xạ cho cột này — vui lòng chọn thủ công.",
+      };
+  }
+  return result;
 }
 
-function findFuzzy(keys: Iterable<string>, target: string): string | undefined {
-  const norm = target.trim().toLowerCase();
-  for (const k of keys) {
-    if (k.trim().toLowerCase() === norm) return k;
-  }
+function findLoosely(
+  map: Map<string, FieldMappingDetail>,
+  header: string,
+): FieldMappingDetail | undefined {
+  const norm = (s: string) => s.toLowerCase().replace(/\s+/g, " ").trim();
+  const target = norm(header);
+  for (const [k, v] of map) if (norm(k) === target) return v;
   return undefined;
 }
 
@@ -161,6 +134,16 @@ function findFuzzy(keys: Iterable<string>, target: string): string | undefined {
 // 2. Merge adjudication (Stage 2)
 // ---------------------------------------------------------------------------
 
+/**
+ * Verdicts come back as an array, one per candidate, from a SINGLE call.
+ *
+ * The earlier design made one Gemini request per (entity, record) pair, so a
+ * 4-row file with 5 retrieved candidates each cost ~20 requests — enough to
+ * exhaust the free tier's daily quota on one spreadsheet. Adjudicating a
+ * record's whole shortlist in one request cuts that by the candidate count and
+ * also gives the model useful context: it can see the alternatives and pick
+ * between them rather than judging each in isolation.
+ */
 const MERGE_VERDICT_RESPONSE = {
   type: Type.OBJECT,
   properties: {
@@ -206,56 +189,12 @@ export interface MergeVerdict {
   reasoning: string;
 }
 
-function heuristicAdjudicate(
-  record: MergeRecordInput,
-  candidates: MergeEntityInput[],
-): Map<string, MergeVerdict> {
-  const out = new Map<string, MergeVerdict>();
-  const recEmail = record.email.trim().toLowerCase();
-  const recPhone = record.phone.replace(/\D/g, "");
-
-  for (const c of candidates) {
-    const candEmail = c.email.trim().toLowerCase();
-    const candPhone = c.phone.replace(/\D/g, "");
-
-    if (recEmail && candEmail && recEmail === candEmail) {
-      out.set(c.id, {
-        isSameEntity: true,
-        confidence: 0.96,
-        reasoning: `Trùng khớp chính xác email (${recEmail}).`,
-      });
-    } else if (recPhone && candPhone && recPhone.length >= 8 && recPhone === candPhone) {
-      out.set(c.id, {
-        isSameEntity: true,
-        confidence: 0.94,
-        reasoning: `Trùng khớp số điện thoại liên hệ (${record.phone}).`,
-      });
-    } else if (c.vectorSimilarity >= 0.9) {
-      out.set(c.id, {
-        isSameEntity: true,
-        confidence: 0.85,
-        reasoning: `Thông tin họ tên, chức danh và đơn vị trùng khớp cao (độ tương đồng vector ${(c.vectorSimilarity * 100).toFixed(0)}%).`,
-      });
-    } else {
-      out.set(c.id, {
-        isSameEntity: false,
-        confidence: 0.75,
-        reasoning: "Chưa đủ thông tin khẳng định là cùng một người.",
-      });
-    }
-  }
-  return out;
-}
-
+/** One request per record; returns a verdict per candidate, keyed by entity id. */
 export async function adjudicateMergeBatch(
   record: MergeRecordInput,
   candidates: MergeEntityInput[],
 ): Promise<Map<string, MergeVerdict>> {
   if (candidates.length === 0) return new Map();
-
-  if (!process.env.GEMINI_API_KEY || isRateLimitCooldownActive()) {
-    return heuristicAdjudicate(record, candidates);
-  }
 
   const candidateBlock = candidates
     .map(
@@ -265,12 +204,14 @@ export async function adjudicateMergeBatch(
 - Chức danh: ${q(c.role)}
 - Email: ${q(c.email)}
 - Điện thoại: ${q(c.phone)}
-- Độ tương đồng vector: ${c.vectorSimilarity.toFixed(3)}`,
+- Độ tương đồng vector giai đoạn 1: ${c.vectorSimilarity.toFixed(3)}`,
     )
     .join("\n\n");
 
   const prompt = `Bạn là hệ thống phân giải trùng lặp thực thể (entity resolution) cho dữ liệu sự kiện Việt Nam.
-Xác định với TỪNG ứng viên xem có phải CÙNG MỘT NGƯỜI với bản ghi nguồn hay không.
+
+Cho MỘT bản ghi nguồn mới và ${candidates.length} thực thể chuẩn ứng viên, hãy xác định với TỪNG ứng viên
+xem có phải CÙNG MỘT NGƯỜI ngoài đời thực với bản ghi nguồn hay không.
 
 BẢN GHI NGUỒN MỚI:
 - Tên: ${q(record.fullName)}
@@ -281,59 +222,83 @@ BẢN GHI NGUỒN MỚI:
 - Sự kiện: ${q(record.eventName)}
 
 CÁC THỰC THỂ CHUẨN ỨNG VIÊN:
-${candidateBlock}`;
+${candidateBlock}
 
-  try {
-    const client = getTextClient();
-    const response = await withRetry("adjudicateMergeBatch", () =>
-      client.models.generateContent({
-        model: config.gemini.model,
-        contents: prompt,
-        config: {
-          ...GEN_CONFIG,
-          responseMimeType: "application/json",
-          responseSchema: MERGE_VERDICT_RESPONSE,
-        },
-      }),
-    );
+Hướng dẫn đánh giá (theo đặc thù dữ liệu Việt Nam):
+- Email trùng khớp hoàn toàn là bằng chứng RẤT MẠNH cho cùng một người.
+- Số điện thoại trùng (bỏ qua khoảng trắng, +84 ≡ 0) là bằng chứng RẤT MẠNH.
+- Biến thể tên hợp lệ: có/không dấu ("Trần Văn A" ≡ "Tran Van A"), viết tắt
+  ("Nguyễn Văn Hoàng" ≡ "N. V. Hoàng"), có/không học hàm học vị ("PGS.TS.").
+- Tên đơn vị viết tắt hoặc song ngữ ("Tập đoàn FPT" ≡ "FPT Corp") là bằng chứng vừa phải.
+- CẢNH BÁO: tên phổ biến ở Việt Nam (Nguyễn Văn A, Trần Thị B) trùng nhau mà
+  KHÔNG có email/điện thoại/đơn vị trùng thì KHÔNG đủ kết luận. Hãy trả về false.
+- Cùng họ tên nhưng khác đơn vị VÀ khác email → nhiều khả năng là hai người khác nhau.
+- Tối đa MỘT ứng viên được phép là true. Nếu nhiều ứng viên cùng giống, chọn ứng viên
+  có bằng chứng mạnh nhất và đặt false cho các ứng viên còn lại.
 
-    const parsed = parseJsonResponse<{
-      verdicts?: {
-        candidate_index?: number;
-        is_same_entity?: boolean;
-        confidence?: number;
-        reasoning?: string;
-      }[];
-    }>(response.text, "adjudicateMergeBatch");
+Trả về đúng ${candidates.length} phần tử, mỗi ứng viên một phần tử, candidate_index khớp số trong ngoặc vuông.
+confidence là mức chắc chắn của bạn về kết luận (dù kết luận là true hay false).
+reasoning phải nêu bằng chứng cụ thể đã dùng, viết bằng tiếng Việt, tối đa 2 câu.`;
 
-    const out = new Map<string, MergeVerdict>();
-    for (const v of parsed.verdicts ?? []) {
-      const idx = typeof v.candidate_index === "number" ? v.candidate_index : NaN;
-      const candidate = candidates[idx];
-      if (!candidate) continue;
-      out.set(candidate.id, {
-        isSameEntity: v.is_same_entity === true,
-        confidence: clamp01(v.confidence),
-        reasoning:
-          typeof v.reasoning === "string" && v.reasoning.trim()
-            ? v.reasoning.trim()
-            : "Mô hình không nêu lý do.",
-      });
-    }
-    return out;
-  } catch (err) {
-    const reason = (err as Error)?.message || "";
-    if (!/rate limit|cooldown|429|quota/i.test(reason)) {
-      console.warn(`[gemini] adjudicateMergeBatch failed (${reason.slice(0, 100)}), using heuristic fallback.`);
-    }
-    return heuristicAdjudicate(record, candidates);
+  const client = getTextClient();
+  const response = await withRetry("adjudicateMergeBatch", () =>
+    client.models.generateContent({
+      model: config.gemini.model,
+      contents: prompt,
+      config: {
+        ...GEN_CONFIG,
+        responseMimeType: "application/json",
+        responseSchema: MERGE_VERDICT_RESPONSE,
+      },
+    }),
+  );
+
+  const parsed = parseJsonResponse<{
+    verdicts?: {
+      candidate_index?: number;
+      is_same_entity?: boolean;
+      confidence?: number;
+      reasoning?: string;
+    }[];
+  }>(response.text, "adjudicateMergeBatch");
+
+  const out = new Map<string, MergeVerdict>();
+  for (const v of parsed.verdicts ?? []) {
+    const idx = typeof v.candidate_index === "number" ? v.candidate_index : NaN;
+    const candidate = candidates[idx];
+    // A hallucinated or out-of-range index is dropped rather than mapped onto
+    // the wrong entity — a mis-keyed verdict would propose a nonsense merge.
+    if (!candidate) continue;
+    out.set(candidate.id, {
+      isSameEntity: v.is_same_entity === true,
+      confidence: clamp01(v.confidence),
+      reasoning:
+        typeof v.reasoning === "string" && v.reasoning.trim()
+          ? v.reasoning.trim()
+          : "Mô hình không nêu lý do.",
+    });
   }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
-// 3. Natural language -> structured filters
+// 3. Natural language -> structured filters (NOT raw SQL)
 // ---------------------------------------------------------------------------
 
+/**
+ * SAFETY MODEL — read before changing.
+ *
+ * The model never authors SQL. It returns a list of {column, operator, value}
+ * triples where column and operator are constrained to enums *in the response
+ * schema itself*, so the model cannot even emit an unlisted identifier. The
+ * server then:
+ *   1. re-validates every column/operator against the whitelist (schema
+ *      enforcement is not a guarantee, so this is defence in depth),
+ *   2. maps the column id to a fixed SQL expression from a lookup table — the
+ *      model's string never reaches the query text,
+ *   3. binds every value as a $n parameter.
+ * There is no code path anywhere that concatenates model output into SQL.
+ */
 const NL_SEARCH_RESPONSE = {
   type: Type.OBJECT,
   properties: {
@@ -362,71 +327,75 @@ export interface NlSearchPlan {
 }
 
 export async function translateNlSearch(userQuery: string): Promise<NlSearchPlan> {
-  const fallbackPlan: NlSearchPlan = {
-    filters: [
-      { column: "display_name", operator: "contains", value: userQuery.trim() },
-      { column: "primary_organization", operator: "contains", value: userQuery.trim() },
-      { column: "primary_role", operator: "contains", value: userQuery.trim() },
-      { column: "event_name", operator: "contains", value: userQuery.trim() },
-    ],
-    logic: "OR",
-    explanation: `Tìm kiếm từ khóa: "${userQuery.trim()}"`,
-  };
-
-  if (!process.env.GEMINI_API_KEY || isRateLimitCooldownActive()) {
-    return fallbackPlan;
-  }
-
   const prompt = `Bạn là bộ dịch câu hỏi tự nhiên (tiếng Việt hoặc tiếng Anh) sang bộ lọc dữ liệu có cấu trúc.
+
 Người dùng đang tìm kiếm trong danh bạ thực thể chuẩn (cá nhân/tổ chức) tổng hợp từ các sự kiện.
+
+Các cột được phép lọc:
+- "display_name": tên hiển thị của người/tổ chức
+- "primary_organization": đơn vị công tác chính
+- "primary_role": chức danh chính
+- "primary_email": địa chỉ email
+- "event_name": tên sự kiện mà thực thể đã tham gia
+- "event_year": năm diễn ra sự kiện đã tham gia (số, ví dụ 2025)
+- "event_count": số lượng sự kiện khác nhau đã tham gia (số)
+
+Các toán tử được phép:
+- "contains": chứa chuỗi con, không phân biệt hoa thường (dùng cho cột văn bản)
+- "equals" / "not_equals": bằng / khác chính xác
+- "gt" / "gte" / "lt" / "lte": lớn hơn / lớn hơn bằng / nhỏ hơn / nhỏ hơn bằng (chỉ dùng cho cột số)
+
+Quy tắc:
+1. Với cột văn bản hầu như luôn dùng "contains", trừ khi người dùng yêu cầu khớp chính xác.
+2. Chỉ dùng gt/gte/lt/lte với "event_year" và "event_count".
+3. "chuyên gia AI" → lọc primary_role contains "chuyên gia" và/hoặc contains "AI".
+   Hãy tách thành nhiều bộ lọc khi hợp lý.
+4. "năm 2025" → event_year equals "2025".
+5. Nếu câu hỏi mơ hồ hoặc chỉ là một từ khóa, hãy tạo các bộ lọc "contains" trên
+   display_name và primary_organization với logic "OR".
+6. logic áp dụng cho TẤT CẢ các bộ lọc. Chọn "AND" khi các điều kiện phải cùng
+   đúng, "OR" khi là tìm kiếm từ khóa rộng.
+7. Không bao giờ để mảng filters rỗng.
 
 Câu hỏi người dùng: ${q(userQuery)}`;
 
-  try {
-    const client = getTextClient();
-    const response = await withRetry("translateNlSearch", () =>
-      client.models.generateContent({
-        model: config.gemini.model,
-        contents: prompt,
-        config: {
-          ...GEN_CONFIG,
-          responseMimeType: "application/json",
-          responseSchema: NL_SEARCH_RESPONSE,
-        },
-      }),
-    );
+  const client = getTextClient();
+  const response = await withRetry("translateNlSearch", () =>
+    client.models.generateContent({
+      model: config.gemini.model,
+      contents: prompt,
+      config: {
+        ...GEN_CONFIG,
+        responseMimeType: "application/json",
+        responseSchema: NL_SEARCH_RESPONSE,
+      },
+    }),
+  );
 
-    const parsed = parseJsonResponse<{
-      filters?: { column?: string; operator?: string; value?: unknown }[];
-      logic?: string;
-      explanation?: string;
-    }>(response.text, "translateNlSearch");
+  const parsed = parseJsonResponse<{
+    filters?: { column?: string; operator?: string; value?: unknown }[];
+    logic?: string;
+    explanation?: string;
+  }>(response.text, "translateNlSearch");
 
-    const filters: NlSearchPlan["filters"] = [];
-    for (const f of parsed.filters ?? []) {
-      if (!isSearchColumn(f.column) || !isSearchOperator(f.operator)) continue;
-      const value = f.value === null || f.value === undefined ? "" : String(f.value).trim();
-      if (!value) continue;
-      filters.push({ column: f.column, operator: f.operator, value });
-    }
-
-    if (filters.length === 0) return fallbackPlan;
-
-    return {
-      filters,
-      logic: parsed.logic === "OR" ? "OR" : "AND",
-      explanation:
-        typeof parsed.explanation === "string" && parsed.explanation.trim()
-          ? parsed.explanation.trim()
-          : `Tìm kiếm cho: "${userQuery}"`,
-    };
-  } catch (err) {
-    const reason = (err as Error)?.message || "";
-    if (!/rate limit|cooldown|429|quota/i.test(reason)) {
-      console.warn(`[gemini] translateNlSearch failed (${reason.slice(0, 100)}), using heuristic plan.`);
-    }
-    return fallbackPlan;
+  // Defence in depth: drop anything not on the whitelist even though the
+  // response schema already constrained it.
+  const filters: NlSearchPlan["filters"] = [];
+  for (const f of parsed.filters ?? []) {
+    if (!isSearchColumn(f.column) || !isSearchOperator(f.operator)) continue;
+    const value = f.value === null || f.value === undefined ? "" : String(f.value).trim();
+    if (!value) continue;
+    filters.push({ column: f.column, operator: f.operator, value });
   }
+
+  return {
+    filters,
+    logic: parsed.logic === "OR" ? "OR" : "AND",
+    explanation:
+      typeof parsed.explanation === "string" && parsed.explanation.trim()
+        ? parsed.explanation.trim()
+        : `Tìm kiếm cho: "${userQuery}"`,
+  };
 }
 
 function isSearchColumn(v: unknown): v is SearchColumnId {
@@ -437,20 +406,24 @@ function isSearchOperator(v: unknown): v is SearchOperatorId {
   return typeof v === "string" && (SEARCH_OPERATOR_IDS as readonly string[]).includes(v);
 }
 
+// ---------------------------------------------------------------------------
+
 function clamp01(v: unknown): number {
   const n = typeof v === "number" ? v : Number(v);
   if (!Number.isFinite(n)) return 0;
   return Math.min(1, Math.max(0, n));
 }
 
+/** Quotes a value for prompt interpolation without letting it break the layout. */
 function q(s: string): string {
   return JSON.stringify(String(s ?? "").slice(0, 500));
 }
 
+/**
+ * One cheap call to confirm GEMINI_MODEL actually resolves. Model ids change
+ * often; failing here at boot with a clear message beats a 404 mid-demo.
+ */
 export async function preflightModel(): Promise<{ ok: boolean; detail: string }> {
-  if (!process.env.GEMINI_API_KEY) {
-    return { ok: false, detail: "GEMINI_API_KEY not configured." };
-  }
   try {
     const client = getTextClient();
     const response = await client.models.generateContent({

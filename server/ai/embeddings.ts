@@ -1,89 +1,72 @@
 import { config } from "../config.js";
-import { getEmbedClient, withRetry, isRateLimitCooldownActive } from "./client.js";
+import { getEmbedClient, withRetry } from "./client.js";
 
 /**
  * Vertex AI / Gemini text embeddings for Stage 1 candidate retrieval.
+ *
+ * There is deliberately NO fallback vector generator here. An earlier version of
+ * this file synthesised a vector from a character sum when the API failed, which
+ * meant entity resolution silently degraded to noise while still looking like it
+ * worked. Embedding failure now propagates: an import either gets real vectors or
+ * it fails loudly.
  */
 
 const BATCH_SIZE = 16;
 
-function fallbackPseudoEmbedding(text: string, dim: number): number[] {
-  const vec = new Array<number>(dim).fill(0);
-  const normalized = text.toLowerCase().trim();
-  if (!normalized) {
-    vec[0] = 1;
-    return vec;
-  }
-  for (let i = 0; i < normalized.length; i++) {
-    const charCode = normalized.charCodeAt(i);
-    const pos = (charCode * 31 + i * 17) % dim;
-    vec[pos] += 1;
-    if (i + 1 < normalized.length) {
-      const bi = (charCode * 37 + normalized.charCodeAt(i + 1) * 43) % dim;
-      vec[bi] += 1.5;
-    }
-  }
-  return normalize(vec);
-}
-
 export async function embedTexts(texts: string[]): Promise<number[][]> {
   if (texts.length === 0) return [];
 
-  if (!process.env.GEMINI_API_KEY || isRateLimitCooldownActive()) {
-    return texts.map((t) => fallbackPseudoEmbedding(t, config.embeddings.dimensions));
-  }
+  const client = getEmbedClient();
+  const out: number[][] = [];
 
-  try {
-    const client = getEmbedClient();
-    const out: number[][] = [];
+  const batchSize =
+    config.embeddings.useVertex && config.embeddings.model === "gemini-embedding-001"
+      ? 1
+      : BATCH_SIZE;
+  for (let i = 0; i < texts.length; i += batchSize) {
+    const batch = texts.slice(i, i + batchSize);
 
-    const batchSize =
-      config.embeddings.useVertex && config.embeddings.model === "gemini-embedding-001"
-        ? 1
-        : BATCH_SIZE;
-    for (let i = 0; i < texts.length; i += batchSize) {
-      const batch = texts.slice(i, i + batchSize);
+    const response = await withRetry(`embedTexts[${i}..${i + batch.length})`, () =>
+      client.models.embedContent({
+        model: config.embeddings.model,
+        contents: batch,
+        config: {
+          outputDimensionality: config.embeddings.dimensions,
+          // SEMANTIC_SIMILARITY is the right task type for dedup: we compare
+          // records against each other symmetrically, not queries against docs.
+          taskType: "SEMANTIC_SIMILARITY",
+        },
+      }),
+    );
 
-      const response = await withRetry(`embedTexts[${i}..${i + batch.length})`, () =>
-        client.models.embedContent({
-          model: config.embeddings.model,
-          contents: batch,
-          config: {
-            outputDimensionality: config.embeddings.dimensions,
-            taskType: "SEMANTIC_SIMILARITY",
-          },
-        }),
+    const embeddings = response.embeddings ?? [];
+    if (embeddings.length !== batch.length) {
+      throw new Error(
+        `embedding batch size mismatch: sent ${batch.length} texts, got ${embeddings.length} vectors`,
       );
-
-      const embeddings = response.embeddings ?? [];
-      if (embeddings.length !== batch.length) {
-        throw new Error(
-          `embedding batch size mismatch: sent ${batch.length} texts, got ${embeddings.length} vectors`,
-        );
-      }
-
-      for (const e of embeddings) {
-        const values = e.values;
-        if (!values || values.length === 0) {
-          throw new Error("embedding API returned an empty vector");
-        }
-        if (values.length !== config.embeddings.dimensions) {
-          throw new Error(
-            `embedding dimension mismatch: model returned ${values.length}, ` +
-              `schema expects VECTOR(${config.embeddings.dimensions}).`,
-          );
-        }
-        out.push(normalize(values));
-      }
     }
 
-    return out;
-  } catch (err) {
-    console.warn(
-      `[embeddings] API failed: ${(err as Error).message}. Using deterministic embedding fallback.`,
-    );
-    return texts.map((t) => fallbackPseudoEmbedding(t, config.embeddings.dimensions));
+    for (const e of embeddings) {
+      const values = e.values;
+      if (!values || values.length === 0) {
+        throw new Error("embedding API returned an empty vector");
+      }
+      if (values.length !== config.embeddings.dimensions) {
+        throw new Error(
+          `embedding dimension mismatch: model returned ${values.length}, ` +
+            `schema expects VECTOR(${config.embeddings.dimensions}). ` +
+            `Set EMBEDDING_DIM and the migration to the same value.`,
+        );
+      }
+      // gemini-embedding-001 does not return unit-normalised vectors when
+      // outputDimensionality truncates them, and cosine distance in pgvector
+      // assumes nothing about magnitude — normalising here keeps the centroid
+      // arithmetic in resolution.ts meaningful.
+      out.push(normalize(values));
+    }
   }
+
+  return out;
 }
 
 export async function embedOne(text: string): Promise<number[]> {

@@ -412,7 +412,14 @@ async function resolveRecord(input: {
 }
 
 async function markAutoRejected(entityId: string, rawRecordId: string): Promise<void> {
-  await repo.markAutoRejected(entityId, rawRecordId);
+  await withTransaction(async (client) => {
+    await client.query(
+      `UPDATE merge_suggestions
+       SET status = 'rejected', decided_at = NOW(), decided_by = 'gemini_stage2'
+       WHERE canonical_entity_id = $1 AND candidate_raw_record_id = $2 AND status = 'pending'`,
+      [entityId, rawRecordId],
+    );
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -457,7 +464,12 @@ export async function approveMerge(input: {
 
     // Any other pending suggestion pointing at this record is now moot — the
     // record has an owner. Resolve them so the review queue stays truthful.
-    await repo.rejectSupersededSuggestions(suggestion.candidateRawRecordId, input.suggestionId, client);
+    await client.query(
+      `UPDATE merge_suggestions
+       SET status = 'rejected', decided_at = NOW(), decided_by = 'superseded'
+       WHERE candidate_raw_record_id = $1 AND status = 'pending' AND id <> $2`,
+      [suggestion.candidateRawRecordId, input.suggestionId],
+    );
 
     return { targetId: suggestion.canonicalEntityId, removedEntityId };
   }).then(async ({ targetId, removedEntityId }) => {

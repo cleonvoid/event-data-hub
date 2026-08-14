@@ -29,7 +29,7 @@ export const DrivePickerModal: React.FC<Props> = ({
     setError(null);
     try {
       const res = await api.driveFiles(q || undefined);
-      setFiles(res?.files ?? []);
+      setFiles(res.files);
     } catch (err) {
       setError({
         message: err instanceof ApiError ? err.message : "Không tải được danh sách tệp",
@@ -117,13 +117,13 @@ export const DrivePickerModal: React.FC<Props> = ({
                     Thử đăng nhập lại để cấp quyền
                   </button>
                 </div>
-              ) : (files ?? []).length === 0 ? (
+              ) : files.length === 0 ? (
                 <div className="p-10 text-center text-sm text-gray-500">
                   Không tìm thấy bảng tính nào.
                 </div>
               ) : (
                 <ul className="divide-y divide-gray-100">
-                  {(files ?? []).map((f) => (
+                  {files.map((f) => (
                     <li key={f.id}>
                       <button
                         onClick={() => onSelect(f)}

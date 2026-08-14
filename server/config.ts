@@ -11,7 +11,7 @@ function bool(v: string | undefined, fallback = false): boolean {
 }
 
 export const config = {
-  port: 3000,
+  port: Number(process.env.PORT ?? 3000),
 
   databaseUrl:
     process.env.DATABASE_URL ??
@@ -24,7 +24,7 @@ export const config = {
      * 404s, the startup preflight in server.ts prints the failure and tells you
      * to override GEMINI_MODEL — it does not silently fall back.
      */
-    model: process.env.GEMINI_MODEL ?? "gemini-2.5-flash",
+    model: process.env.GEMINI_MODEL ?? "gemini-3.6-flash",
   },
 
   embeddings: {
@@ -80,7 +80,7 @@ export const config = {
     minCombinedConfidence: Number(process.env.RESOLUTION_MIN_COMBINED ?? 0.5),
   },
 
-  isProduction: process.env.NODE_ENV === "production",
+  isProduction: process.env.NODE_ENV === "production" || Boolean(process.env.K_SERVICE),
 };
 
 export type AppConfig = typeof config;
