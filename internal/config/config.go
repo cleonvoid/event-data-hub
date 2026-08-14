@@ -21,10 +21,18 @@ type Config struct {
 	GCPProject     string
 	GCPLocation    string
 
-	AuthMode          string // "firebase" | "dev"
-	FirebaseProjectID string
-	DevOrgID          string
-	DevEmail          string
+	AuthMode           string // "firebase" | "dev"
+	FirebaseProjectID  string
+	FirebaseAPIKey     string
+	FirebaseAuthDomain string
+	FirebaseAppID      string
+	// FirebaseServiceAccountJSON supplies a signing key. Verifying a token needs
+	// only Google's public certificates, but minting a session cookie is a
+	// privileged call that must sign — so without this the runtime's default
+	// credentials have to carry the Service Account Token Creator role.
+	FirebaseServiceAccountJSON string
+	DevOrgID                   string
+	DevEmail                   string
 
 	ResolutionTopN        int
 	MinVectorSimilarity   float64
@@ -47,16 +55,21 @@ func Load() Config {
 		GCPProject:     env("GOOGLE_CLOUD_PROJECT", ""),
 		GCPLocation:    env("GOOGLE_CLOUD_LOCATION", "us-central1"),
 
-		AuthMode:          env("AUTH_MODE", "dev"),
-		FirebaseProjectID: env("FIREBASE_PROJECT_ID", ""),
-		DevOrgID:          env("DEV_ORG_ID", "org_local_dev"),
-		DevEmail:          env("DEV_EMAIL", "dev@localhost"),
+		AuthMode:           env("AUTH_MODE", "dev"),
+		FirebaseProjectID:  env("FIREBASE_PROJECT_ID", ""),
+		FirebaseAPIKey:     env("VITE_FIREBASE_API_KEY", ""),
+		FirebaseAuthDomain: env("VITE_FIREBASE_AUTH_DOMAIN", ""),
+		FirebaseAppID:      env("VITE_FIREBASE_APP_ID", ""),
+
+		FirebaseServiceAccountJSON: env("FIREBASE_SERVICE_ACCOUNT_JSON", ""),
+		DevOrgID:                   env("DEV_ORG_ID", "org_local_dev"),
+		DevEmail:                   env("DEV_EMAIL", "dev@localhost"),
 
 		ResolutionTopN:        envInt("RESOLUTION_TOP_N", 5),
 		MinVectorSimilarity:   envFloat("RESOLUTION_MIN_SIMILARITY", 0.89),
 		MinCombinedConfidence: envFloat("RESOLUTION_MIN_COMBINED", 0.5),
 
-		IsProduction: env("GO_ENV", "") == "production" || env("NODE_ENV", "") == "production",
+		IsProduction: env("GO_ENV", "") == "production" || env("NODE_ENV", "") == "production" || env("K_SERVICE", "") != "",
 	}
 }
 

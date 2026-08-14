@@ -101,6 +101,10 @@ type NewRawRecord struct {
 
 func (d *DB) InsertRawRecord(ctx context.Context, tx pgx.Tx, r NewRawRecord) (string, error) {
 	var id string
+	var embedding any
+	if len(r.Embedding) > 0 {
+		embedding = vectorLiteral(r.Embedding)
+	}
 	err := tx.QueryRow(ctx, `
 		INSERT INTO raw_records (
 			source_id, organization_id, row_number, raw_data,
@@ -115,7 +119,7 @@ func (d *DB) InsertRawRecord(ctx context.Context, tx pgx.Tx, r NewRawRecord) (st
 		r.SourceID, r.OrganizationID, r.RowNumber, r.RawDataJSON,
 		r.FullName, r.Organization, r.RoleTitle, r.Email, r.Phone,
 		r.EventName, r.EventDate, r.EventDateRaw, r.Notes,
-		r.NormalizedText, vectorLiteral(r.Embedding),
+		r.NormalizedText, embedding,
 	).Scan(&id)
 	return id, err
 }
@@ -173,50 +177,6 @@ func (d *DB) GetRecordsForEntity(ctx context.Context, orgID, entityID string) ([
 	return out, rows.Err()
 }
 
-func (d *DB) GetEmbeddingsForEntity(ctx context.Context, entityID string) ([][]float32, error) {
-	rows, err := d.Pool.Query(ctx, `
-		SELECT r.embedding::text
-		FROM raw_to_canonical l JOIN raw_records r ON r.id = l.raw_record_id
-		WHERE l.canonical_entity_id = $1 AND r.embedding IS NOT NULL`, entityID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var out [][]float32
-	for rows.Next() {
-		var lit string
-		if err := rows.Scan(&lit); err != nil {
-			return nil, err
-		}
-		v, err := parseVectorLiteral(lit)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, v)
-	}
-	return out, rows.Err()
-}
-
-func parseVectorLiteral(s string) ([]float32, error) {
-	s = strings.TrimSpace(s)
-	s = strings.TrimPrefix(s, "[")
-	s = strings.TrimSuffix(s, "]")
-	if s == "" {
-		return nil, nil
-	}
-	parts := strings.Split(s, ",")
-	out := make([]float32, 0, len(parts))
-	for _, p := range parts {
-		var f float32
-		if _, err := fmt.Sscanf(strings.TrimSpace(p), "%g", &f); err != nil {
-			return nil, fmt.Errorf("parse vector element %q: %w", p, err)
-		}
-		out = append(out, f)
-	}
-	return out, nil
-}
-
 // ---------------------------------------------------------------------------
 // Canonical entities
 // ---------------------------------------------------------------------------
@@ -241,13 +201,6 @@ func (d *DB) LinkRecordToEntity(ctx context.Context, tx pgx.Tx, recordID, entity
 		INSERT INTO raw_to_canonical (raw_record_id, canonical_entity_id, organization_id, link_method)
 		VALUES ($1,$2,$3,$4)
 		ON CONFLICT (raw_record_id) DO NOTHING`, recordID, entityID, orgID, method)
-	return err
-}
-
-func (d *DB) UpdateEntityCentroid(ctx context.Context, entityID string, embedding []float32) error {
-	_, err := d.Pool.Exec(ctx, `
-		UPDATE canonical_entities SET embedding = $2::vector, updated_at = NOW() WHERE id = $1`,
-		entityID, vectorLiteral(embedding))
 	return err
 }
 
@@ -335,20 +288,41 @@ func (d *DB) ListEntities(ctx context.Context, orgID string, predicate string, p
 // The NOT EXISTS clause is the negative signal: any pair that already has a
 // merge_suggestions row — pending, approved, or rejected — is excluded, so a
 // rejected pair is never proposed again.
-func (d *DB) FindCandidatesByVector(ctx context.Context, orgID, recordID string, embedding []float32, topN int) ([]CandidateEntity, error) {
-	rows, err := d.Pool.Query(ctx, `
+//
+// Every one of those quals is invisible to the HNSW index, so pgvector applies
+// them only after the approximate scan has chosen its candidate tuples. Import
+// seeds one entity per row, which means a file listing the same person 100
+// times fills the neighbourhood with near-zero-distance duplicates that the
+// row_number qual then discards — and the one eligible earlier row need not be
+// among them. runVectorScan therefore widens the scan first; see
+// vectorScanSettings.
+func (d *DB) FindCandidatesByVector(ctx context.Context, orgID, recordID, entityType string, embedding []float32, topN int) ([]CandidateEntity, error) {
+	rows, release, err := d.runVectorScan(ctx, `
 		SELECT `+entityColumns+`, 1 - (c.embedding <=> $2::vector) AS similarity
 		FROM canonical_entities c
-		WHERE c.organization_id = $1
-		  AND c.embedding IS NOT NULL
+			WHERE c.organization_id = $1
+			  AND c.entity_type = $5
+			  AND c.embedding IS NOT NULL
+			  AND NOT EXISTS (
+			      SELECT 1 FROM raw_to_canonical own
+			      WHERE own.canonical_entity_id = c.id AND own.raw_record_id = $3)
+			  AND NOT EXISTS (
+			      SELECT 1
+			      FROM raw_to_canonical candidate_link
+			      JOIN raw_records candidate_raw ON candidate_raw.id = candidate_link.raw_record_id
+			      JOIN raw_records current_raw ON current_raw.id = $3
+			      WHERE candidate_link.canonical_entity_id = c.id
+			        AND candidate_raw.source_id = current_raw.source_id
+			        AND candidate_raw.row_number >= current_raw.row_number)
 		  AND NOT EXISTS (
 		      SELECT 1 FROM merge_suggestions ms
 		      WHERE ms.canonical_entity_id = c.id AND ms.candidate_raw_record_id = $3)
 		ORDER BY c.embedding <=> $2::vector
-		LIMIT $4`, orgID, vectorLiteral(embedding), recordID, topN)
+			LIMIT $4`, orgID, vectorLiteral(embedding), recordID, topN, entityType)
 	if err != nil {
 		return nil, fmt.Errorf("vector retrieval: %w", err)
 	}
+	defer release()
 	defer rows.Close()
 
 	var out []CandidateEntity
@@ -366,10 +340,58 @@ func (d *DB) FindCandidatesByVector(ctx context.Context, orgID, recordID string,
 	return out, rows.Err()
 }
 
+// vectorScanSettings widens the HNSW scan so that quals pgvector can only
+// apply after the fact still leave usable candidates.
+//
+// With pgvector 0.8.0+ the right tool is iterative scan: the index keeps
+// returning batches until enough tuples survive the filters. strict_order (not
+// relaxed_order) is required here because the query pairs ORDER BY distance
+// with LIMIT, and relaxed ordering could let the LIMIT cut a nearer entity.
+// On older servers there is no such mechanism, so the only lever is a much
+// larger ef_search — mitigation, not a guarantee.
+func vectorScanSettings(iterativeScan bool) []string {
+	if iterativeScan {
+		return []string{
+			`SET LOCAL hnsw.iterative_scan = 'strict_order'`,
+			`SET LOCAL hnsw.ef_search = 100`,
+		}
+	}
+	return []string{`SET LOCAL hnsw.ef_search = 400`}
+}
+
+// runVectorScan executes an HNSW query with those settings applied. SET LOCAL
+// needs a transaction, and the transaction has to outlive the pgx.Rows, so the
+// caller gets a release func to call once it has finished scanning.
+func (d *DB) runVectorScan(ctx context.Context, sql string, args ...any) (pgx.Rows, func(), error) {
+	tx, err := d.Pool.Begin(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("begin vector scan: %w", err)
+	}
+	release := func() { _ = tx.Rollback(ctx) } // read-only; nothing to commit
+	for _, stmt := range vectorScanSettings(d.iterativeScan) {
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			release()
+			return nil, nil, fmt.Errorf("tune vector scan (%s): %w", stmt, err)
+		}
+	}
+	rows, err := tx.Query(ctx, sql, args...)
+	if err != nil {
+		release()
+		return nil, nil, err
+	}
+	return rows, release, nil
+}
+
 // FindCandidatesByIdentifier blocks on exact email/phone. Cosine distance over
 // "name | org | role" cannot see an email at all, so someone who changed both
 // employer and job title would otherwise be missed despite an unambiguous
 // identifier being present.
+//
+// Deliberately not filtered by entity_type. The type is *inferred* per row —
+// a row is only "organization" when it happens to carry no name and no email —
+// so the same organisation can enter the system under either type. An exact
+// email or phone match is stronger evidence than that inference, and filtering
+// on it would bypass blocking in exactly the ambiguous cases it exists for.
 func (d *DB) FindCandidatesByIdentifier(ctx context.Context, orgID, recordID, email, phone string) ([]CandidateEntity, error) {
 	if email == "" && phone == "" {
 		return nil, nil
@@ -377,13 +399,24 @@ func (d *DB) FindCandidatesByIdentifier(ctx context.Context, orgID, recordID, em
 	rows, err := d.Pool.Query(ctx, `
 		SELECT `+entityColumns+`
 		FROM canonical_entities c
-		WHERE c.organization_id = $1
+			WHERE c.organization_id = $1
 		  AND (($2 <> '' AND LOWER(c.primary_email) = $2)
 		    OR ($3 <> '' AND regexp_replace(COALESCE(c.primary_phone,''), '[^0-9]', '', 'g') = $3))
-		  AND NOT EXISTS (
-		      SELECT 1 FROM merge_suggestions ms
-		      WHERE ms.canonical_entity_id = c.id AND ms.candidate_raw_record_id = $4)
-		LIMIT 5`, orgID, strings.ToLower(email), digitsOnly(phone), recordID)
+			  AND NOT EXISTS (
+			      SELECT 1 FROM merge_suggestions ms
+			      WHERE ms.canonical_entity_id = c.id AND ms.candidate_raw_record_id = $4)
+			  AND NOT EXISTS (
+			      SELECT 1 FROM raw_to_canonical own
+			      WHERE own.canonical_entity_id = c.id AND own.raw_record_id = $4)
+			  AND NOT EXISTS (
+			      SELECT 1
+			      FROM raw_to_canonical candidate_link
+			      JOIN raw_records candidate_raw ON candidate_raw.id = candidate_link.raw_record_id
+			      JOIN raw_records current_raw ON current_raw.id = $4
+			      WHERE candidate_link.canonical_entity_id = c.id
+			        AND candidate_raw.source_id = current_raw.source_id
+			        AND candidate_raw.row_number >= current_raw.row_number)
+			LIMIT 5`, orgID, strings.ToLower(email), digitsOnly(phone), recordID)
 	if err != nil {
 		return nil, fmt.Errorf("identifier blocking: %w", err)
 	}

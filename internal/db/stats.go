@@ -8,6 +8,7 @@ import (
 
 func (d *DB) GetStats(ctx context.Context, orgID string) (Stats, error) {
 	var s Stats
+	var linkedRawRecords int
 
 	err := d.Pool.QueryRow(ctx, `
 		SELECT
@@ -15,16 +16,17 @@ func (d *DB) GetStats(ctx context.Context, orgID string) (Stats, error) {
 			(SELECT COUNT(*) FROM raw_records        WHERE organization_id = $1),
 			(SELECT COUNT(*) FROM sources            WHERE organization_id = $1),
 			(SELECT COUNT(*) FROM merge_suggestions
-			  WHERE organization_id = $1 AND status = 'pending')`, orgID,
-	).Scan(&s.TotalCanonicalEntities, &s.TotalRawRecords, &s.SourceFilesProcessed, &s.PendingMergeSuggestions)
+			  WHERE organization_id = $1 AND status = 'pending'),
+			(SELECT COUNT(DISTINCT raw_record_id) FROM raw_to_canonical
+			  WHERE organization_id = $1)`, orgID,
+	).Scan(&s.TotalCanonicalEntities, &s.TotalRawRecords, &s.SourceFilesProcessed, &s.PendingMergeSuggestions, &linkedRawRecords)
 	if err != nil {
 		return s, fmt.Errorf("stats: %w", err)
 	}
 
-	// Share of raw records collapsed away by approved merges. 0 when nothing
-	// has been deduplicated yet, which is the honest answer before review.
-	if s.TotalRawRecords > 0 {
-		rate := float64(s.TotalRawRecords-s.TotalCanonicalEntities) / float64(s.TotalRawRecords) * 100
+	// Raw-only rows cannot be deduplicated, so only count linked records.
+	if linkedRawRecords > 0 {
+		rate := float64(linkedRawRecords-s.TotalCanonicalEntities) / float64(linkedRawRecords) * 100
 		s.DedupRatePercent = math.Round(rate*10) / 10
 	}
 

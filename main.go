@@ -93,7 +93,7 @@ func run() error {
 	app := handlers.New(database, aiClient, cfg, tpl)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{$}", app.Index)
+	mux.HandleFunc("GET /app", app.Index)
 	mux.HandleFunc("GET /fragments/entities", app.Entities)
 	mux.HandleFunc("GET /fragments/entity", app.EntityDrawer)
 	mux.HandleFunc("GET /fragments/sidebar", app.Stats)
@@ -108,6 +108,13 @@ func run() error {
 	// /healthz stays outside the auth middleware so Cloud Run can probe it.
 	root := http.NewServeMux()
 	root.HandleFunc("GET /healthz", app.Health)
+	if cfg.AuthMode == "firebase" {
+		root.HandleFunc("GET /{$}", app.Login)
+		root.HandleFunc("POST /session", authMw.EstablishSession)
+		root.HandleFunc("DELETE /session", authMw.ClearSession)
+	} else {
+		mux.HandleFunc("GET /{$}", app.Index)
+	}
 	root.Handle("/", authMw.Wrap(mux))
 
 	server := &http.Server{

@@ -17,6 +17,38 @@ Kho mã chứa **hai bản triển khai chạy trên cùng một cơ sở dữ l
 
 ## 1. Chạy nhanh (local)
 
+> **Nâng cấp từ Postgres 16 lên 18.** `docker-compose.yml` nay dùng ảnh `pg18-trixie` và volume `pgdata18`. Cluster do pg16 tạo ra **không** đọc được bằng 18, nên dữ liệu cũ vẫn nằm nguyên trong volume cũ và cluster 18 khởi tạo rỗng — không mất gì, nhưng cũng không tự chuyển sang.
+>
+> **Nếu container pg16 vẫn đang chạy** (chưa `docker compose up` với file mới), dump trực tiếp — cách gọn nhất:
+>
+> ```bash
+> docker exec event_data_hub_db pg_dump -U postgres event_data_hub > edh-pg16.sql
+> ```
+>
+> **Nếu đã chuyển sang pg18 rồi**, phải dựng tạm một container pg16 trỏ vào volume cũ. Không được để hai postmaster cùng mở một thư mục dữ liệu, nên **dừng container hiện tại trước**. Tên volume có tiền tố là tên thư mục dự án (mặc định `event-data-hub_pgdata`) — kiểm tra bằng `docker volume ls`:
+>
+> ```bash
+> docker compose down                       # dừng cluster 18 đang chạy
+> docker volume ls | grep pgdata            # xác nhận tên volume cũ
+>
+> docker run -d --name edh_pg16_dump \
+>   -v event-data-hub_pgdata:/var/lib/postgresql/data \
+>   -e POSTGRES_PASSWORD=postgrespassword \
+>   pgvector/pgvector:pg16
+> until docker exec edh_pg16_dump pg_isready -U postgres; do sleep 1; done
+> docker exec edh_pg16_dump pg_dump -U postgres event_data_hub > edh-pg16.sql
+> docker rm -f edh_pg16_dump
+> ```
+>
+> Rồi nạp lại vào cluster 18:
+>
+> ```bash
+> docker compose up -d postgres
+> docker exec -i event_data_hub_db psql -U postgres -d event_data_hub < edh-pg16.sql
+> ```
+>
+> Muốn ở lại pg16 thì đổi `image:` về `pgvector/pgvector:pg16`, bỏ dòng `PGDATA` và trả volume về `pgdata`.
+
 ```bash
 # 1. Khởi động Postgres kèm pgvector (cổng host 5433 để tránh đụng Postgres sẵn có)
 docker compose up -d postgres
@@ -61,9 +93,10 @@ Lệnh này nhập hai bảng tính cố ý "bẩn" (tiếng Việt có dấu / 
 | `AUTH_MODE` | | `dev` | `dev` bỏ qua đăng nhập; **bị từ chối khi `NODE_ENV=production`** |
 | `DEV_ORG_ID` | | `org_local_dev` | Tổ chức dùng ở chế độ dev |
 | `FIREBASE_PROJECT_ID` | khi `AUTH_MODE=firebase` | — | |
+| `FIREBASE_SERVICE_ACCOUNT_JSON` | khi `AUTH_MODE=firebase` | — | Khoá tài khoản dịch vụ Firebase để tạo/thu hồi session cookie. Bỏ trống thì ADC phải có `roles/firebaseauth.admin`, nếu không sẽ không đăng nhập được |
 | `VITE_FIREBASE_*` | khi bật đăng nhập | — | Cấu hình Firebase phía trình duyệt |
 | `RESOLUTION_TOP_N` | | `5` | Số ứng viên Stage 1 lấy về mỗi bản ghi |
-| `RESOLUTION_MIN_SIMILARITY` | | `0.55` | Ngưỡng cosine trước khi tốn một lượt gọi Gemini |
+| `RESOLUTION_MIN_SIMILARITY` | | `0.89` | Ngưỡng cosine trước khi tốn một lượt gọi Gemini |
 | `RESOLUTION_MIN_COMBINED` | | `0.5` | Ngưỡng điểm tổng hợp trước khi hiện gợi ý |
 
 ---
@@ -108,9 +141,9 @@ Mặc định là `gemini-3.5-flash`. `gemini-3.6-flash` cũng hợp lệ (đã 
 
 **Tín hiệu phủ định.** Bảng `merge_suggestions` có chỉ mục duy nhất trên `(canonical_entity_id, candidate_raw_record_id)`. Khi người dùng từ chối, bản ghi vẫn ở lại với `status='rejected'`; Stage 1 loại trừ mọi cặp đã có bản ghi bằng `NOT EXISTS`, nên **cặp đã bị từ chối không bao giờ được đề xuất lại** và cũng không tốn thêm lượt gọi Gemini.
 
-### Vì sao mỗi bản ghi luôn tạo một thực thể riêng
+### Vì sao mỗi bản ghi có danh tính tạo một thực thể riêng
 
-Khi nhập, mỗi bản ghi thô luôn được gắn với đúng một thực thể chuẩn (`link_method='seed'`). Gợi ý đang chờ không thay đổi điều đó. Khi bạn phê duyệt, bản ghi được chuyển sang thực thể đích và thực thể "seed" rỗng bị xóa.
+Khi nhập, mỗi bản ghi xác định được cá nhân hoặc tổ chức được gắn với đúng một thực thể chuẩn (`link_method='seed'`). Dòng chưa đủ danh tính vẫn được lưu nguyên bản nhưng chưa gắn thực thể. Gợi ý đang chờ không thay đổi liên kết; khi bạn phê duyệt, bản ghi được chuyển sang thực thể đích và thực thể "seed" rỗng bị xóa.
 
 Nhờ vậy **tỷ lệ hợp nhất là con số trung thực**: nó chỉ cải thiện khi có người thật sự phê duyệt, chứ không phải một con số đẹp có sẵn.
 
@@ -159,10 +192,40 @@ Access token của Google hết hạn sau khoảng 1 giờ và Firebase SDK **kh
 
 | `AUTH_MODE` | Hành vi |
 |---|---|
-| `dev` | Bỏ qua xác thực, mọi request thuộc `DEV_ORG_ID`. **Bị từ chối khi `NODE_ENV=production`.** |
+| `dev` | Bỏ qua xác thực, mọi request thuộc `DEV_ORG_ID`. **Bị từ chối trong production và trên Cloud Run.** |
 | `firebase` | Kiểm tra chữ ký RS256 của Firebase ID token theo khóa công khai của Google, cùng issuer/audience/expiry. |
 
-Khóa tổ chức (`organization_id`) lấy từ custom claim `org_id`; nếu không có thì suy ra từ tên miền email (`org_example.gov.vn`). Mọi truy vấn đều lọc theo `organization_id`.
+Khóa tổ chức (`organization_id`) lấy từ custom claim `org_id`. Nếu chưa có claim, mỗi Firebase UID được cách ly trong một tổ chức cá nhân riêng; hệ thống không gộp người dùng theo tên miền email. Mọi truy vấn đều lọc theo `organization_id`.
+
+Phiên đăng nhập dùng **Firebase session cookie** (HttpOnly, SameSite=Strict), không phải ID token thô. Mỗi request đều kiểm tra thu hồi — đăng xuất hoặc khoá tài khoản có hiệu lực ngay.
+
+Tạo cookie (`:createSessionCookie`) và thu hồi refresh token là **lệnh gọi API Firebase Auth có đặc quyền**, không phải ký cục bộ, nên tài khoản dịch vụ cần các quyền `firebaseauth.users.createSession`, `firebaseauth.users.get` và `firebaseauth.users.update` — gọn nhất là `roles/firebaseauth.admin`. Khoá do Firebase cấp (`FIREBASE_SERVICE_ACCOUNT_JSON`) đã có sẵn các quyền này.
+
+### Di trú dữ liệu từ khóa tổ chức cũ
+
+Trước đây `organization_id` suy ra từ tên miền email (`org_fpt.com`), nên dữ liệu cũ nằm dưới khóa mà cơ chế mới không bao giờ sinh ra — sau khi nâng cấp sẽ không còn truy cập được. Lệnh dưới đây chuyển mỗi nguồn (và toàn bộ bản ghi, thực thể, gợi ý hợp nhất của nó) sang tổ chức cá nhân của người đã nhập nó, tra theo `imported_by`:
+
+```bash
+# 1. Liệt kê các tổ chức còn dùng khóa cũ (không ghi gì)
+go run ./cmd/migrate-tenants
+
+# 2. Chạy thử cho tổ chức đã chọn — thực thi rồi hoàn tác, nên số liệu là số thật
+go run ./cmd/migrate-tenants -orgs=org_fpt.com
+
+# 3. Thực hiện
+go run ./cmd/migrate-tenants -orgs=org_fpt.com -apply
+```
+
+`-orgs` là **bắt buộc** và `-apply` không chạy nếu thiếu nó: một `org_id` đặt qua custom claim cũng không có tiền tố `org_user_`, nên không thể tự đoán đâu là dữ liệu cũ mà không xoá nhầm một tổ chức có thật.
+
+Vài điểm cần biết trước khi chạy:
+
+- **Nguồn dùng chung thực thể luôn đi cùng nhau.** Duyệt một gợi ý hợp nhất sẽ nối một thực thể với bản ghi từ nhiều nguồn; tách chúng ra sẽ để lại thực thể nằm giữa hai tổ chức. Các nguồn như vậy được gom thành một nhóm không thể chia nhỏ và cùng về một chủ sở hữu.
+- **Gợi ý hợp nhất nằm giữa hai tổ chức sẽ bị xoá.** Một gợi ý `pending` trỏ tới bản ghi ứng viên chưa được nối, nên nó có thể rơi sang nhóm khác; nếu giữ lại, bấm duyệt sẽ kéo bản ghi của tổ chức khác sang. Số lượng được báo cáo ở bước chạy thử.
+- **Có cổng kiểm tra toàn vẹn.** Trước khi commit, lệnh đếm mọi dòng có `organization_id` lệch với đối tượng nó thuộc về; chỉ cần một dòng là toàn bộ giao dịch bị hoàn tác.
+- Nguồn nào không tra được tài khoản Firebase (dữ liệu dev, nhân sự đã nghỉ) sẽ được liệt kê và giữ nguyên.
+
+Lưu ý: dữ liệu trước đây dùng chung theo tên miền sẽ trở thành riêng của người tải lên — muốn giữ chung, hãy đặt custom claim `org_id` cho các tài khoản liên quan thay vì chạy lệnh này.
 
 ---
 
@@ -187,6 +250,7 @@ gcloud run deploy event-data-hub \
   --region $REGION --platform managed --allow-unauthenticated \
   --add-cloudsql-instances $PROJECT_ID:$REGION:event-hub-db \
   --set-env-vars "AUTH_MODE=firebase,FIREBASE_PROJECT_ID=$PROJECT_ID" \
+  --set-env-vars "VITE_FIREBASE_API_KEY=...,VITE_FIREBASE_AUTH_DOMAIN=$PROJECT_ID.firebaseapp.com,VITE_FIREBASE_APP_ID=..." \
   --set-env-vars "USE_VERTEX_EMBEDDINGS=true,GOOGLE_CLOUD_PROJECT=$PROJECT_ID,GOOGLE_CLOUD_LOCATION=$REGION" \
   --set-env-vars "DATABASE_URL=postgres://USER:PASS@/event_data_hub?host=/cloudsql/$PROJECT_ID:$REGION:event-hub-db" \
   --set-secrets "GEMINI_API_KEY=gemini-api-key:latest"
@@ -236,7 +300,7 @@ Những điểm này là **cố ý** và cần xử lý trước khi dùng thậ
 - **Bảng tạm khi nhập dữ liệu nằm trong bộ nhớ tiến trình.** Bản Go giữ bảng tính đã phân tích trong RAM (TTL 30 phút) giữa bước xem trước và bước xác nhận; bản Node gửi dữ liệu vòng qua trình duyệt. Cả hai đều **không hoạt động đúng khi Cloud Run chạy nhiều instance**. Cần chuyển sang Memorystore/Redis hoặc bảng tạm trong DB.
 - **Giới hạn 5000 dòng mỗi lần nhập**, và toàn bộ quá trình đối chiếu chạy đồng bộ trong một request. Với tệp lớn nên chuyển sang hàng đợi nền (Cloud Tasks).
 - **`xlsx@0.18.5` trên npm có CVE prototype pollution đã biết** và không còn được cập nhật trên registry npm. Bản Go dùng `excelize` không bị ảnh hưởng. Nếu nhận tệp từ nguồn không tin cậy, hãy đổi sang `exceljs` hoặc cài SheetJS từ `cdn.sheetjs.com`.
-- **Chưa có test tự động.** Phần đã được kiểm chứng thủ công: migration, vòng đời nhập → gợi ý → duyệt, việc xóa thực thể rỗng sau khi gộp, và tín hiệu phủ định.
+- **Test tự động hiện tập trung vào các lỗi hồi quy quan trọng:** giới hạn batch Vertex AI, cô lập tenant Firebase, hiển thị lỗi HTMX và bảo toàn dữ liệu thô khi nhập. Luồng migration và nhập → gợi ý → duyệt vẫn cần kiểm thử tích hợp đầy đủ hơn.
 - **Ngưỡng `RESOLUTION_MIN_SIMILARITY = 0.89` được đo, không phải đoán.** Trên bộ seed, embedding của chuỗi `họ tên | đơn vị | chức danh` đặt những người **không liên quan** ở 0.804–0.880 (các chuỗi này gần như cùng cấu trúc nên dải tương đồng bị nén lại), còn biến thể tên **thật sự trùng** ở 0.909–0.940. Hãy **đo lại trên dữ liệu của bạn** trước khi đổi. Nâng ngưỡng an toàn vì bước blocking theo email/SĐT chạy song song và bỏ qua ngưỡng này.
 - **`GEMINI_MODEL` đã được kiểm chứng lúc khởi động.** Nếu API key của bạn không truy cập được model đang đặt, log khởi động sẽ báo rõ và bạn chỉ cần đổi biến môi trường.
 - **Ngày tháng không phân tích được sẽ giữ nguyên bản** trong `event_date_raw` và `event_date` để `NULL`, thay vì đoán bừa. Giao diện đánh dấu "chưa nhận dạng".

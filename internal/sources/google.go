@@ -73,7 +73,7 @@ func (g *GoogleClient) do(ctx context.Context, rawURL, accessToken string) (*htt
 	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		resp.Body.Close()
+		_ = resp.Body.Close()
 
 		message := strings.TrimSpace(string(body))
 		var parsed struct {
@@ -140,7 +140,7 @@ func (g *GoogleClient) ListSpreadsheets(ctx context.Context, accessToken, search
 			} `json:"files"`
 		}
 		err = json.NewDecoder(resp.Body).Decode(&body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if err != nil {
 			return nil, fmt.Errorf("giải mã danh sách Drive: %w", err)
 		}
@@ -184,7 +184,7 @@ func (g *GoogleClient) ReadGoogleSheet(ctx context.Context, accessToken, spreads
 		} `json:"sheets"`
 	}
 	err = json.NewDecoder(resp.Body).Decode(&meta)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if err != nil {
 		return nil, fmt.Errorf("giải mã metadata bảng tính: %w", err)
 	}
@@ -206,7 +206,7 @@ func (g *GoogleClient) ReadGoogleSheet(ctx context.Context, accessToken, spreads
 		Values [][]any `json:"values"`
 	}
 	err = json.NewDecoder(resp.Body).Decode(&values)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if err != nil {
 		return nil, fmt.Errorf("giải mã dữ liệu bảng tính: %w", err)
 	}
@@ -235,7 +235,7 @@ func (g *GoogleClient) ReadDriveXLSX(ctx context.Context, accessToken, fileID st
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// 60MB ceiling so a hostile or accidental huge file cannot exhaust memory.
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 60<<20))

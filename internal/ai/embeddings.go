@@ -24,8 +24,9 @@ func (c *Client) EmbedTexts(ctx context.Context, texts []string) ([][]float32, e
 	dim := int32(c.cfg.EmbeddingDim)
 	out := make([][]float32, 0, len(texts))
 
-	for start := 0; start < len(texts); start += embedBatchSize {
-		end := start + embedBatchSize
+	batchSize := c.embeddingBatchSize()
+	for start := 0; start < len(texts); start += batchSize {
+		end := start + batchSize
 		if end > len(texts) {
 			end = len(texts)
 		}
@@ -66,8 +67,14 @@ func (c *Client) EmbedTexts(ctx context.Context, texts []string) ([][]float32, e
 	return out, nil
 }
 
-// Normalize scales a vector to unit length so cosine distance in pgvector and
-// the centroid arithmetic below stay meaningful.
+func (c *Client) embeddingBatchSize() int {
+	if c.cfg.UseVertex && c.cfg.EmbeddingModel == "gemini-embedding-001" {
+		return 1
+	}
+	return embedBatchSize
+}
+
+// Normalize scales a vector to unit length before storage and cosine search.
 func Normalize(v []float32) []float32 {
 	var sum float64
 	for _, f := range v {
@@ -84,27 +91,4 @@ func Normalize(v []float32) []float32 {
 		out[i] = float32(float64(f) / mag)
 	}
 	return out
-}
-
-// Centroid is the element-wise mean of unit vectors, re-normalised. Used to
-// keep a canonical entity's embedding representative as it absorbs name variants.
-func Centroid(vectors [][]float32) ([]float32, error) {
-	if len(vectors) == 0 {
-		return nil, fmt.Errorf("centroid cần ít nhất một vector")
-	}
-	dim := len(vectors[0])
-	acc := make([]float64, dim)
-	for _, v := range vectors {
-		if len(v) != dim {
-			return nil, fmt.Errorf("centroid: vector khác số chiều (%d vs %d)", len(v), dim)
-		}
-		for i, f := range v {
-			acc[i] += float64(f)
-		}
-	}
-	out := make([]float32, dim)
-	for i := range acc {
-		out[i] = float32(acc[i] / float64(len(vectors)))
-	}
-	return Normalize(out), nil
 }

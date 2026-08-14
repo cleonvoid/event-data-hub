@@ -174,13 +174,13 @@ type MergeVerdict struct {
 
 // MergeRecord is the new raw record being resolved.
 type MergeRecord struct {
-	Name, Org, Role, Email, Phone, Event string
+	Type, Name, Org, Role, Email, Phone, Event string
 }
 
 // MergeEntity is one Stage 1 candidate.
 type MergeEntity struct {
-	ID, Name, Org, Role, Email, Phone string
-	VectorSimilarity                  float64
+	ID, Type, Name, Org, Role, Email, Phone string
+	VectorSimilarity                        float64
 }
 
 // Verdicts come back as an array, one per candidate, from a SINGLE call.
@@ -226,21 +226,23 @@ func (c *Client) AdjudicateMergeBatch(ctx context.Context, record MergeRecord, c
 			block.WriteString("\n\n")
 		}
 		fmt.Fprintf(&block, `[%d]
+- Loại: %q
 - Tên: %q
 - Đơn vị: %q
 - Chức danh: %q
 - Email: %q
 - Điện thoại: %q
 - Độ tương đồng vector giai đoạn 1: %.3f`,
-			i, cand.Name, cand.Org, cand.Role, cand.Email, cand.Phone, cand.VectorSimilarity)
+			i, cand.Type, cand.Name, cand.Org, cand.Role, cand.Email, cand.Phone, cand.VectorSimilarity)
 	}
 
 	prompt := fmt.Sprintf(`Bạn là hệ thống phân giải trùng lặp thực thể (entity resolution) cho dữ liệu sự kiện Việt Nam.
 
 Cho MỘT bản ghi nguồn mới và %d thực thể chuẩn ứng viên, hãy xác định với TỪNG ứng viên
-xem có phải CÙNG MỘT NGƯỜI ngoài đời thực với bản ghi nguồn hay không.
+xem có phải CÙNG MỘT CÁ NHÂN HOẶC TỔ CHỨC ngoài đời thực với bản ghi nguồn hay không.
 
 BẢN GHI NGUỒN MỚI:
+- Loại: %q
 - Tên: %q
 - Đơn vị: %q
 - Chức danh: %q
@@ -267,7 +269,7 @@ Trả về đúng %d phần tử, mỗi ứng viên một phần tử, candidate
 confidence là mức chắc chắn của bạn về kết luận (dù kết luận là true hay false).
 reasoning phải nêu bằng chứng cụ thể đã dùng, viết bằng tiếng Việt, tối đa 2 câu.`,
 		len(candidates),
-		record.Name, record.Org, record.Role, record.Email, record.Phone, record.Event,
+		record.Type, record.Name, record.Org, record.Role, record.Email, record.Phone, record.Event,
 		block.String(), len(candidates))
 
 	var parsed struct {

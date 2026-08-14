@@ -31,7 +31,8 @@ type Client struct {
 // embeddings use Vertex AI when USE_VERTEX_EMBEDDINGS=true (Cloud Run gets
 // credentials from ADC, so no API key is needed there).
 func New(ctx context.Context, cfg config.Config) (*Client, error) {
-	if cfg.GeminiAPIKey == "" && !(cfg.UseVertex && cfg.GCPProject != "") {
+	vertexConfigured := cfg.UseVertex && cfg.GCPProject != ""
+	if cfg.GeminiAPIKey == "" && !vertexConfigured {
 		return nil, ErrNotConfigured
 	}
 

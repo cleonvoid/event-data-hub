@@ -1,5 +1,5 @@
 import type pg from "pg";
-import { pool, query, vectorToSql } from "./db.js";
+import { pool, query, vectorScan, vectorToSql } from "./db.js";
 import {
   eventCountSubquery,
   recordCountSubquery,
@@ -381,6 +381,12 @@ export interface CandidateEntity {
  * The NOT EXISTS against merge_suggestions is the negative signal: any pair that
  * already has a suggestion row — pending, approved, or REJECTED — is excluded,
  * so a rejected pair can never be proposed to the user a second time.
+ *
+ * Neither that anti-join nor the organization_id filter is visible to the HNSW
+ * index, so pgvector applies both only after the approximate scan has picked its
+ * tuples. Run through vectorScan, which widens the scan first — otherwise a
+ * database holding many tenants can return the querying tenant nothing at all,
+ * because every one of the nearest entities belonged to somebody else.
  */
 export async function findCandidateEntitiesByVector(
   organizationId: string,
@@ -389,7 +395,7 @@ export async function findCandidateEntitiesByVector(
   topN: number,
   client?: Executor,
 ): Promise<CandidateEntity[]> {
-  const res = await db(client).query(
+  const res = await vectorScan(
     `SELECT ${ENTITY_COLUMNS},
             1 - (c.embedding <=> $2::vector) AS similarity
      FROM canonical_entities c
@@ -403,6 +409,7 @@ export async function findCandidateEntitiesByVector(
      ORDER BY c.embedding <=> $2::vector
      LIMIT $4`,
     [organizationId, vectorToSql(embedding), rawRecordId, topN],
+    client,
   );
   return res.rows.map((r) => ({
     entity: mapEntity(r),
@@ -620,13 +627,16 @@ export async function getStats(organizationId: string): Promise<StatsSummary> {
     total_raw: string;
     total_sources: string;
     pending_merges: string;
+    linked_raw: string;
   }>(
     `SELECT
        (SELECT COUNT(*) FROM canonical_entities WHERE organization_id = $1) AS total_entities,
        (SELECT COUNT(*) FROM raw_records        WHERE organization_id = $1) AS total_raw,
        (SELECT COUNT(*) FROM sources            WHERE organization_id = $1) AS total_sources,
        (SELECT COUNT(*) FROM merge_suggestions
-         WHERE organization_id = $1 AND status = 'pending')                 AS pending_merges`,
+         WHERE organization_id = $1 AND status = 'pending')                 AS pending_merges,
+       (SELECT COUNT(DISTINCT raw_record_id) FROM raw_to_canonical
+         WHERE organization_id = $1)                                          AS linked_raw`,
     [organizationId],
   );
 
@@ -644,13 +654,14 @@ export async function getStats(organizationId: string): Promise<StatsSummary> {
 
   const totalRaw = Number(res.rows[0]?.total_raw ?? 0);
   const totalEntities = Number(res.rows[0]?.total_entities ?? 0);
+  const linkedRaw = Number(res.rows[0]?.linked_raw ?? 0);
 
   return {
     totalCanonicalEntities: totalEntities,
     totalRawRecords: totalRaw,
-    // Share of raw records that collapsed away. 0 when nothing is deduplicated.
+    // Raw-only rows cannot be deduplicated, so only count linked records.
     dedupRatePercent:
-      totalRaw > 0 ? Number((((totalRaw - totalEntities) / totalRaw) * 100).toFixed(1)) : 0,
+      linkedRaw > 0 ? Number((((linkedRaw - totalEntities) / linkedRaw) * 100).toFixed(1)) : 0,
     sourceFilesProcessed: Number(res.rows[0]?.total_sources ?? 0),
     pendingMergeSuggestions: Number(res.rows[0]?.pending_merges ?? 0),
     bySourceType: byType.rows.map((r) => ({

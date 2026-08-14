@@ -80,7 +80,7 @@ export const config = {
     minCombinedConfidence: Number(process.env.RESOLUTION_MIN_COMBINED ?? 0.5),
   },
 
-  isProduction: process.env.NODE_ENV === "production",
+  isProduction: process.env.NODE_ENV === "production" || Boolean(process.env.K_SERVICE),
 };
 
 export type AppConfig = typeof config;

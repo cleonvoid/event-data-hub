@@ -36,6 +36,96 @@ export async function query<T extends pg.QueryResultRow = pg.QueryResultRow>(
   return pool.query<T>(text, params as unknown[]);
 }
 
+/**
+ * Whether the server's pgvector supports hnsw.iterative_scan (0.8.0+).
+ *
+ * Read from pg_extension rather than pg_settings: pgvector registers its GUCs in
+ * the module's _PG_init, which Postgres runs lazily the first time a session
+ * touches a vector type, so on a freshly-opened pooled connection the setting is
+ * absent from pg_settings even when it is supported.
+ */
+let iterativeScan = false;
+
+function versionAtLeast(version: string, major: number, minor: number): boolean {
+  const parts = version.split(".");
+  if (parts.length < 2) return false;
+  const gotMajor = Number.parseInt(parts[0] ?? "", 10);
+  const gotMinor = Number.parseInt(parts[1] ?? "", 10);
+  if (Number.isNaN(gotMajor) || Number.isNaN(gotMinor)) return false;
+  return gotMajor === major ? gotMinor >= minor : gotMajor > major;
+}
+
+async function detectIterativeScan(): Promise<void> {
+  try {
+    const res = await query<{ extversion: string }>(
+      "SELECT extversion FROM pg_extension WHERE extname = 'vector'",
+    );
+    const version = res.rows[0]?.extversion;
+    if (!version) {
+      console.log("[db] pgvector extension not found");
+      return;
+    }
+    iterativeScan = versionAtLeast(version, 0, 8);
+    console.log(
+      iterativeScan
+        ? `[db] pgvector ${version} — iterative scan enabled for candidate retrieval`
+        : `[db] pgvector ${version} predates iterative scan (0.8.0+); using a wider ef_search`,
+    );
+  } catch (err) {
+    console.error("[db] could not read pgvector version:", (err as Error).message);
+  }
+}
+
+/**
+ * Settings that widen an HNSW scan so quals pgvector can only apply afterwards
+ * still leave usable candidates.
+ *
+ * Stage 1 filters by organization_id and by an anti-join against
+ * merge_suggestions, neither of which the index can evaluate. pgvector applies
+ * them to the ~ef_search tuples the approximate scan already chose, so in a
+ * database with many tenants the nearest neighbours can all belong to other
+ * organisations and be filtered away, returning nothing. Iterative scan keeps
+ * pulling batches until enough rows survive; strict_order (not relaxed_order)
+ * because the query pairs ORDER BY distance with LIMIT.
+ */
+function vectorScanSettings(): string[] {
+  return iterativeScan
+    ? ["SET LOCAL hnsw.iterative_scan = 'strict_order'", "SET LOCAL hnsw.ef_search = 100"]
+    : ["SET LOCAL hnsw.ef_search = 400"];
+}
+
+/**
+ * Runs an HNSW query with those settings applied. SET LOCAL needs a
+ * transaction, so this owns one unless the caller passes a client that is
+ * already inside one.
+ */
+export async function vectorScan<T extends pg.QueryResultRow = pg.QueryResultRow>(
+  text: string,
+  params: readonly QueryParam[] = [],
+  client?: Pick<pg.PoolClient, "query">,
+): Promise<pg.QueryResult<T>> {
+  if (client) {
+    for (const stmt of vectorScanSettings()) await client.query(stmt);
+    return client.query<T>(text, params as unknown[]);
+  }
+
+  const owned = await pool.connect();
+  try {
+    await owned.query("BEGIN");
+    for (const stmt of vectorScanSettings()) await owned.query(stmt);
+    const result = await owned.query<T>(text, params as unknown[]);
+    await owned.query("COMMIT"); // read-only; COMMIT and ROLLBACK are equivalent here
+    return result;
+  } catch (err) {
+    await owned.query("ROLLBACK").catch(() => {
+      /* connection already broken; the throw below is the real error */
+    });
+    throw err;
+  } finally {
+    owned.release();
+  }
+}
+
 /** Runs fn inside a transaction, rolling back on any throw. */
 export async function withTransaction<T>(
   fn: (client: pg.PoolClient) => Promise<T>,
@@ -114,6 +204,8 @@ export async function runMigrations(): Promise<void> {
     });
     console.log(`[db] applied migration ${version}`);
   }
+
+  await detectIterativeScan();
 }
 
 export async function closePool(): Promise<void> {

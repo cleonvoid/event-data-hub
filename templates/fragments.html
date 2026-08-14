@@ -29,7 +29,7 @@
         <span class="text-lg font-bold text-emerald-700">{{printf "%.1f" .DedupRatePercent}}%</span>
       </div>
       <p class="text-[11px] text-emerald-700/80 mt-0.5">
-        {{.TotalRawRecords}} bản ghi thô → {{.TotalCanonicalEntities}} thực thể
+        {{.TotalRawRecords}} bản ghi thô • {{.TotalCanonicalEntities}} thực thể
       </p>
     </div>
 
@@ -492,11 +492,12 @@
     <div class="p-5 space-y-2 text-sm">
       {{with .Result}}
       <div class="flex justify-between"><span class="text-gray-500">Bản ghi đã nhập</span><b>{{.ImportedRecords}}</b></div>
-      <div class="flex justify-between"><span class="text-gray-500">Dòng bị bỏ qua</span><b>{{.SkippedRows}}</b></div>
+      <div class="flex justify-between"><span class="text-gray-500" title="Đã lưu nguyên văn nhưng không tạo được thực thể, nên không tham gia đối chiếu trùng lặp.">Dòng không nhận diện được</span><b>{{.UnidentifiedRows}}</b></div>
       <div class="flex justify-between"><span class="text-gray-500">Thực thể mới</span><b>{{.NewEntities}}</b></div>
       <div class="flex justify-between"><span class="text-gray-500">Gợi ý hợp nhất chờ duyệt</span><b class="text-blue-700">{{.SuggestionsCreated}}</b></div>
       <div class="flex justify-between"><span class="text-gray-500">Cặp bị loại tự động</span><b>{{.AutoRejected}}</b></div>
       <div class="flex justify-between"><span class="text-gray-500">Lượt gọi Gemini</span><b>{{.GeminiCalls}}</b></div>
+      {{if .ResolutionErrors}}<div class="flex justify-between text-amber-800"><span>Đối chiếu cần chạy lại</span><b>{{.ResolutionErrors}}</b></div>{{end}}
       {{end}}
     </div>
     <div class="bg-gray-50 border-t border-gray-200 px-5 py-3.5 flex justify-end">

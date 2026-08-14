@@ -68,6 +68,8 @@ func (a *App) render(w http.ResponseWriter, name string, data any) {
 // failures appear where the user was looking instead of vanishing into console.
 func (a *App) renderError(w http.ResponseWriter, status int, message string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("HX-Retarget", "#modal-host")
+	w.Header().Set("HX-Reswap", "innerHTML")
 	w.WriteHeader(status)
 	if err := a.Tpl.ExecuteTemplate(w, "error_banner", map[string]any{"Message": message}); err != nil {
 		log.Printf("[render] error_banner: %v", err)

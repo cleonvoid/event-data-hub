@@ -74,6 +74,8 @@ type ParsedRow struct {
 	EventDateRaw   string
 	Notes          string
 	NormalizedText string
+	EntityType     string
+	Resolvable     bool
 }
 
 // ParseRows applies the user-confirmed mapping to the sheet rows.
@@ -81,8 +83,18 @@ type ParsedRow struct {
 // Multiple source columns may map to the same canonical field (two "Ghi chú"
 // columns, say); their values are joined rather than one silently winning. The
 // full original row is preserved in RawData regardless of mapping.
-func ParseRows(headers []string, rows [][]string, mapping map[string]string, fallbackEventName string) []ParsedRow {
+//
+// rowNumbers carries each row's real line in the source sheet (see
+// sources.Grid.RowNumbers). When it is absent or the wrong length the rows are
+// assumed contiguous from line 2.
+func ParseRows(headers []string, rows [][]string, mapping map[string]string, fallbackEventName string, rowNumbers []int) []ParsedRow {
 	out := make([]ParsedRow, 0, len(rows))
+	sourceRow := func(i int) int {
+		if len(rowNumbers) == len(rows) {
+			return rowNumbers[i]
+		}
+		return i + 2
+	}
 
 	for i, row := range rows {
 		rawData := make(map[string]string, len(headers))
@@ -91,9 +103,10 @@ func ParseRows(headers []string, rows [][]string, mapping map[string]string, fal
 		for c, header := range headers {
 			var value string
 			if c < len(row) {
-				value = normalize.Cell(row[c])
+				value = row[c]
 			}
 			rawData[header] = value
+			value = normalize.Cell(value)
 
 			target := mapping[header]
 			if target == "" || target == "ignore" || !ai.IsCanonicalField(target) || value == "" {
@@ -109,12 +122,6 @@ func ParseRows(headers []string, rows [][]string, mapping map[string]string, fal
 		fullName := take("full_name")
 		email := normalize.Email(take("email"))
 
-		// A row with neither a name nor an email identifies nobody — skip it
-		// rather than manufacturing a placeholder entity.
-		if fullName == "" && email == "" {
-			continue
-		}
-
 		organization := take("organization")
 		roleTitle := take("role_title")
 		eventDateRaw := take("event_date")
@@ -123,8 +130,17 @@ func ParseRows(headers []string, rows [][]string, mapping map[string]string, fal
 			eventName = fallbackEventName
 		}
 
+		entityType := "person"
+		resolvable := fullName != "" || email != ""
+		normalizedText := normalize.Identity(fullName, organization, roleTitle)
+		if !resolvable && organization != "" {
+			entityType = "organization"
+			resolvable = true
+			normalizedText = normalize.Identity(organization, "", roleTitle)
+		}
+
 		out = append(out, ParsedRow{
-			RowNumber:      i + 1,
+			RowNumber:      sourceRow(i),
 			RawData:        rawData,
 			FullName:       fullName,
 			Organization:   organization,
@@ -135,7 +151,9 @@ func ParseRows(headers []string, rows [][]string, mapping map[string]string, fal
 			EventDate:      normalize.EventDate(eventDateRaw),
 			EventDateRaw:   eventDateRaw,
 			Notes:          take("notes"),
-			NormalizedText: normalize.Identity(fullName, organization, roleTitle),
+			NormalizedText: normalizedText,
+			EntityType:     entityType,
+			Resolvable:     resolvable,
 		})
 	}
 	return out
@@ -164,39 +182,52 @@ type ImportInput struct {
 	ExternalFileID string
 	Headers        []string
 	Rows           [][]string
+	RowNumbers     []int
 	Mapping        map[string]string
 }
 
 type ImportResult struct {
-	SourceID           string
-	ImportedRecords    int
-	SkippedRows        int
+	SourceID        string
+	ImportedRecords int
+	// UnidentifiedRows counts rows that were imported verbatim but named nobody
+	// — no full name, no email, no organization — so no canonical entity was
+	// created and they can never take part in deduplication. Previously
+	// reported as "skipped" and hard-wired to 0, which described neither what
+	// happened to the rows nor how many there were.
+	UnidentifiedRows   int
 	NewEntities        int
 	SuggestionsCreated int
 	AutoRejected       int
 	GeminiCalls        int
+	ResolutionErrors   int
 }
 
 func (s *Service) Import(ctx context.Context, in ImportInput) (ImportResult, error) {
 	var res ImportResult
 
 	fallbackEventName := trimExtension(in.SourceName)
-	parsed := ParseRows(in.Headers, in.Rows, in.Mapping, fallbackEventName)
-	res.SkippedRows = len(in.Rows) - len(parsed)
-
+	parsed := ParseRows(in.Headers, in.Rows, in.Mapping, fallbackEventName, in.RowNumbers)
 	if len(parsed) == 0 {
-		return res, fmt.Errorf("không có dòng nào chứa họ tên hoặc email hợp lệ — vui lòng kiểm tra lại ánh xạ cột")
+		return res, fmt.Errorf("không có dòng dữ liệu nào để nhập")
 	}
 
-	// Embed everything up front, in batches. This is the slow step, so doing it
-	// once beats interleaving it with per-row database work.
-	texts := make([]string, len(parsed))
+	// Embed only rows that identify a person or organization. Unresolvable rows
+	// are still preserved verbatim as raw records.
+	var texts []string
+	var resolvableIndexes []int
 	for i, p := range parsed {
-		texts[i] = p.NormalizedText
+		if p.Resolvable {
+			texts = append(texts, p.NormalizedText)
+			resolvableIndexes = append(resolvableIndexes, i)
+		}
 	}
-	embeddings, err := s.AI.EmbedTexts(ctx, texts)
+	embedded, err := s.AI.EmbedTexts(ctx, texts)
 	if err != nil {
 		return res, fmt.Errorf("tạo embedding thất bại: %w", err)
+	}
+	embeddings := make([][]float32, len(parsed))
+	for i, parsedIndex := range resolvableIndexes {
+		embeddings[parsedIndex] = embedded[i]
 	}
 
 	mappingJSON, err := json.Marshal(in.Mapping)
@@ -204,8 +235,8 @@ func (s *Service) Import(ctx context.Context, in ImportInput) (ImportResult, err
 		return res, err
 	}
 
-	// The source row and all raw records land in one transaction: a
-	// half-imported file is worse than a failed one.
+	// The source, every raw row, and every initial canonical link land in one
+	// transaction. After this commits there can be no unlinked partial import.
 	recordIDs := make([]string, len(parsed))
 	err = s.DB.WithTx(ctx, func(tx pgx.Tx) error {
 		sourceID, err := s.DB.CreateSource(ctx, tx, db.Source{
@@ -245,6 +276,33 @@ func (s *Service) Import(ctx context.Context, in ImportInput) (ImportResult, err
 				return fmt.Errorf("lưu bản ghi dòng %d: %w", p.RowNumber, err)
 			}
 			recordIDs[i] = id
+
+			if !p.Resolvable {
+				continue
+			}
+			displayName := p.FullName
+			if displayName == "" && p.EntityType == "organization" {
+				displayName = p.Organization
+			}
+			if displayName == "" {
+				displayName = p.Email
+			}
+			entityID, err := s.DB.CreateCanonicalEntity(ctx, tx, db.CanonicalEntity{
+				OrganizationID:      in.OrganizationID,
+				EntityType:          p.EntityType,
+				DisplayName:         displayName,
+				PrimaryEmail:        p.Email,
+				PrimaryPhone:        p.Phone,
+				PrimaryOrganization: p.Organization,
+				PrimaryRole:         p.RoleTitle,
+			}, embeddings[i])
+			if err != nil {
+				return fmt.Errorf("tạo thực thể dòng %d: %w", p.RowNumber, err)
+			}
+			if err := s.DB.LinkRecordToEntity(ctx, tx, id, entityID, in.OrganizationID, "seed"); err != nil {
+				return err
+			}
+			res.NewEntities++
 		}
 		return nil
 	})
@@ -252,16 +310,20 @@ func (s *Service) Import(ctx context.Context, in ImportInput) (ImportResult, err
 		return res, err
 	}
 	res.ImportedRecords = len(parsed)
+	res.UnidentifiedRows = len(parsed) - len(resolvableIndexes)
 
-	// Resolution runs outside the import transaction and sequentially: each
-	// record must be able to match entities seeded by earlier records in the
-	// same file, which is the common case when one sheet lists a person twice.
+	// Candidate generation is best effort after the durable import. Reporting a
+	// failed import here would prompt a retry and duplicate already-saved rows.
 	for i, p := range parsed {
+		if !p.Resolvable {
+			continue
+		}
 		outcome, err := s.resolveRecord(ctx, in.OrganizationID, recordIDs[i], p, embeddings[i])
 		if err != nil {
-			return res, err
+			res.ResolutionErrors++
+			log.Printf("[resolution] record %s failed after import: %v", recordIDs[i], err)
+			continue
 		}
-		res.NewEntities += outcome.newEntities
 		res.SuggestionsCreated += outcome.suggestions
 		res.AutoRejected += outcome.autoRejected
 		res.GeminiCalls += outcome.geminiCalls
@@ -271,7 +333,6 @@ func (s *Service) Import(ctx context.Context, in ImportInput) (ImportResult, err
 }
 
 type resolveOutcome struct {
-	newEntities  int
 	suggestions  int
 	autoRejected int
 	geminiCalls  int
@@ -279,13 +340,12 @@ type resolveOutcome struct {
 
 // resolveRecord resolves one freshly-inserted raw record.
 //
-// Order matters: candidate retrieval happens BEFORE the record's own seed
-// entity is created, so the record can never match itself.
+// Candidate queries exclude the record's own seed entity.
 func (s *Service) resolveRecord(ctx context.Context, orgID, recordID string, p ParsedRow, embedding []float32) (resolveOutcome, error) {
 	var out resolveOutcome
 
 	// ---- Stage 1: vector retrieval + deterministic identifier blocking ----
-	byVector, err := s.DB.FindCandidatesByVector(ctx, orgID, recordID, embedding, s.Cfg.ResolutionTopN)
+	byVector, err := s.DB.FindCandidatesByVector(ctx, orgID, recordID, p.EntityType, embedding, s.Cfg.ResolutionTopN)
 	if err != nil {
 		return out, err
 	}
@@ -325,6 +385,7 @@ func (s *Service) resolveRecord(ctx context.Context, orgID, recordID string, p P
 		for i, c := range shortlist {
 			entities[i] = ai.MergeEntity{
 				ID:               c.Entity.ID,
+				Type:             c.Entity.EntityType,
 				Name:             c.Entity.DisplayName,
 				Org:              c.Entity.PrimaryOrganization,
 				Role:             c.Entity.PrimaryRole,
@@ -336,6 +397,7 @@ func (s *Service) resolveRecord(ctx context.Context, orgID, recordID string, p P
 
 		out.geminiCalls++
 		v, err := s.AI.AdjudicateMergeBatch(ctx, ai.MergeRecord{
+			Type:  p.EntityType,
 			Name:  p.FullName,
 			Org:   p.Organization,
 			Role:  p.RoleTitle,
@@ -406,61 +468,14 @@ func (s *Service) resolveRecord(ctx context.Context, orgID, recordID string, p P
 		}
 	}
 
-	// ---- Always seed the record's own canonical entity ----
-	// Every raw record belongs to exactly one entity from the moment it lands.
-	// A pending suggestion does not change that; approving one later moves the
-	// record onto the target and removes this now-empty seed. That keeps the
-	// dedup statistic honest — it only improves when a human approves a merge.
-	displayName := p.FullName
-	if displayName == "" {
-		displayName = p.Email
-	}
-	if displayName == "" {
-		displayName = "(không rõ)"
-	}
-
-	err = s.DB.WithTx(ctx, func(tx pgx.Tx) error {
-		entityID, err := s.DB.CreateCanonicalEntity(ctx, tx, db.CanonicalEntity{
-			OrganizationID:      orgID,
-			EntityType:          "person",
-			DisplayName:         displayName,
-			PrimaryEmail:        p.Email,
-			PrimaryPhone:        p.Phone,
-			PrimaryOrganization: p.Organization,
-			PrimaryRole:         p.RoleTitle,
-		}, embedding)
-		if err != nil {
-			return err
-		}
-		return s.DB.LinkRecordToEntity(ctx, tx, recordID, entityID, orgID, "seed")
-	})
-	if err != nil {
-		return out, err
-	}
-	out.newEntities++
-
 	return out, nil
 }
 
 // Approve applies a merge and refreshes the target entity's centroid so Stage 1
 // retrieval improves as the entity accumulates name variants.
 func (s *Service) Approve(ctx context.Context, orgID, suggestionID, decidedBy string) error {
-	entityID, err := s.DB.ApproveMerge(ctx, orgID, suggestionID, decidedBy)
-	if err != nil {
-		return err
-	}
-	vectors, err := s.DB.GetEmbeddingsForEntity(ctx, entityID)
-	if err != nil {
-		return err
-	}
-	if len(vectors) == 0 {
-		return nil
-	}
-	c, err := ai.Centroid(vectors)
-	if err != nil {
-		return err
-	}
-	return s.DB.UpdateEntityCentroid(ctx, entityID, c)
+	_, err := s.DB.ApproveMerge(ctx, orgID, suggestionID, decidedBy)
+	return err
 }
 
 func trimExtension(name string) string {

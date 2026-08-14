@@ -1,4 +1,5 @@
 import type { NextFunction, Request, Response } from "express";
+import { createHash } from "node:crypto";
 import { cert, getApps, initializeApp, applicationDefault } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import { config } from "./config.js";
@@ -54,15 +55,16 @@ function ensureFirebaseApp(): void {
 }
 
 /**
- * Derives the tenant key. A custom claim wins; otherwise every user from the
- * same email domain shares an organization, which is the right default for the
- * public-sector / innovation-centre users in the brief.
+ * Derives the tenant key. A custom claim wins; without one, each Firebase UID
+ * is isolated instead of grouping unrelated users by email domain.
  */
-function deriveOrganizationId(claims: Record<string, unknown>, email: string): string {
+function deriveOrganizationId(claims: Record<string, unknown>, uid: string): string {
   const claim = claims.org_id ?? claims.organization_id;
-  if (typeof claim === "string" && claim.trim()) return claim.trim();
-  const domain = email.split("@")[1]?.toLowerCase().replace(/[^a-z0-9.-]/g, "");
-  return domain ? `org_${domain}` : "org_unknown";
+  if (typeof claim === "string" && /^[a-zA-Z0-9._-]{1,128}$/.test(claim.trim())) {
+    return claim.trim();
+  }
+  const digest = createHash("sha256").update(uid).digest("hex").slice(0, 24);
+  return `org_user_${digest}`;
 }
 
 export function assertAuthConfigSane(): void {
@@ -99,7 +101,7 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
       req.user = {
         uid: decoded.uid,
         email,
-        organizationId: deriveOrganizationId(decoded as Record<string, unknown>, email),
+        organizationId: deriveOrganizationId(decoded as Record<string, unknown>, decoded.uid),
       };
       next();
     } catch (err) {

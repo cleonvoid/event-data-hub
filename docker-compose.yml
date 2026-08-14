@@ -1,16 +1,28 @@
 services:
   postgres:
-    image: pgvector/pgvector:pg16
+    image: pgvector/pgvector:pg18-trixie
     container_name: event_data_hub_db
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgrespassword
       POSTGRES_DB: event_data_hub
+      # Postgres 18 images moved the default PGDATA and their declared VOLUME up
+      # to /var/lib/postgresql. Pinning it back keeps the cluster inside the
+      # mount below — otherwise the named volume holds an empty directory and
+      # local data silently stops surviving `docker compose up`.
+      PGDATA: /var/lib/postgresql/data
     # Host port 5433 to avoid colliding with any other local Postgres on 5432.
     ports:
       - "5433:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      # pgdata18, not pgdata: a data directory initialised by the previous pg16
+      # image cannot be read by 18, and Postgres refuses to start against it.
+      # A distinct name lets 18 initialise cleanly and leaves the old volume
+      # intact for anyone who still needs to dump from it.
+      #
+      # Note this means an existing pg16 database does NOT carry over — the new
+      # cluster starts empty. README §1 has the dump/restore steps.
+      - pgdata18:/var/lib/postgresql/data
     # Migrations are NOT mounted into /docker-entrypoint-initdb.d. That directory
     # executes files alphabetically, which would run 000001_init.down.sql before
     # 000001_init.up.sql. Both apps apply migrations themselves on startup.
@@ -21,4 +33,4 @@ services:
       retries: 10
 
 volumes:
-  pgdata:
+  pgdata18:

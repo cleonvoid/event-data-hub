@@ -39,7 +39,9 @@ func (a *App) UploadPreview(w http.ResponseWriter, r *http.Request) {
 		a.renderError(w, http.StatusBadRequest, "Chưa chọn tệp để tải lên")
 		return
 	}
-	defer file.Close()
+	// Read-only handle on the uploaded part; a close error tells us nothing the
+	// caller could act on.
+	defer func() { _ = file.Close() }()
 
 	grid, err := sources.ParseSpreadsheet(file)
 	if err != nil {
@@ -195,6 +197,9 @@ func (a *App) ImportConfirm(w http.ResponseWriter, r *http.Request) {
 		if value == "full_name" || value == "email" {
 			hasIdentity = true
 		}
+		if value == "organization" {
+			hasIdentity = true
+		}
 	}
 	if mapped == 0 {
 		a.renderError(w, http.StatusBadRequest, "Cần ánh xạ ít nhất một cột sang trường chuẩn")
@@ -202,7 +207,11 @@ func (a *App) ImportConfirm(w http.ResponseWriter, r *http.Request) {
 	}
 	if !hasIdentity {
 		a.renderError(w, http.StatusBadRequest,
-			"Cần ánh xạ ít nhất một cột sang \"Họ và tên\" hoặc \"Email\" để nhận diện được bản ghi")
+			"Cần ánh xạ ít nhất một cột sang \"Họ và tên\", \"Email\" hoặc \"Đơn vị\"")
+		return
+	}
+	if staged.SourceType != "local_upload" && staged.SourceType != "google_sheets" && staged.SourceType != "google_drive_xlsx" {
+		a.renderError(w, http.StatusBadRequest, "Loại nguồn dữ liệu không hợp lệ")
 		return
 	}
 
@@ -214,6 +223,7 @@ func (a *App) ImportConfirm(w http.ResponseWriter, r *http.Request) {
 		ExternalFileID: staged.ExternalFileID,
 		Headers:        staged.Grid.Headers,
 		Rows:           staged.Grid.Rows,
+		RowNumbers:     staged.Grid.RowNumbers,
 		Mapping:        mapping,
 	})
 	if err != nil {

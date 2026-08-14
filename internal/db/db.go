@@ -4,10 +4,12 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -16,6 +18,15 @@ import (
 
 type DB struct {
 	Pool *pgxpool.Pool
+
+	// iterativeScan records whether the server's pgvector supports
+	// hnsw.iterative_scan (0.8.0+). Stage 1 retrieval filters candidates with
+	// quals the HNSW index cannot evaluate, and pgvector applies those *after*
+	// the approximate scan has already picked its ~ef_search tuples. Without
+	// iterative scan a heavily filtered query can come back empty even though
+	// matching rows exist. Detected once, after migrations have created the
+	// extension.
+	iterativeScan bool
 }
 
 // Connect opens the pool and verifies it. Unlike the previous version this
@@ -125,7 +136,62 @@ func (d *DB) RunMigrations(ctx context.Context) error {
 		}
 		fmt.Printf("[db] applied migration %s\n", version)
 	}
+
+	d.detectIterativeScan(ctx)
 	return nil
+}
+
+// detectIterativeScan resolves the capability once, from the installed pgvector
+// version.
+//
+// Deliberately not probed via pg_settings: pgvector registers its GUCs in the
+// module's _PG_init, which Postgres runs lazily the first time a session touches
+// a vector type. On a freshly opened pooled connection — exactly what this
+// probe gets — hnsw.iterative_scan is therefore absent from pg_settings even on
+// 0.8.6, which would report the feature as missing. pg_extension is a catalog
+// table and answers correctly on a cold connection.
+func (d *DB) detectIterativeScan(ctx context.Context) {
+	var version string
+	err := d.Pool.QueryRow(ctx,
+		`SELECT extversion FROM pg_extension WHERE extname = 'vector'`).Scan(&version)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		fmt.Println("[db] pgvector extension not found")
+		return
+	case err != nil:
+		fmt.Printf("[db] could not read pgvector version: %v\n", err)
+		return
+	}
+
+	d.iterativeScan = versionAtLeast(version, 0, 8)
+	if d.iterativeScan {
+		fmt.Printf("[db] pgvector %s — iterative scan enabled for candidate retrieval\n", version)
+	} else {
+		fmt.Printf("[db] pgvector %s predates iterative scan (0.8.0+); "+
+			"falling back to a wider ef_search for candidate retrieval\n", version)
+	}
+}
+
+// versionAtLeast compares the leading major.minor of an extension version such
+// as "0.8.6". Unparseable input reports false, which selects the conservative
+// fallback rather than a setting the server may not honour.
+func versionAtLeast(version string, major, minor int) bool {
+	parts := strings.SplitN(version, ".", 3)
+	if len(parts) < 2 {
+		return false
+	}
+	gotMajor, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil {
+		return false
+	}
+	gotMinor, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil {
+		return false
+	}
+	if gotMajor != major {
+		return gotMajor > major
+	}
+	return gotMinor >= minor
 }
 
 func migrationsDir() (string, error) {

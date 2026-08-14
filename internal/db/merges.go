@@ -177,6 +177,21 @@ func (d *DB) ApproveMerge(ctx context.Context, orgID, suggestionID, decidedBy st
 			if err := d.EnrichEntityFromRecord(ctx, tx, canonicalID, rec); err != nil {
 				return err
 			}
+
+			// Keep the target embedding derived from every linked raw vector inside
+			// the same transaction as the approved merge.
+			if _, err := tx.Exec(ctx, `
+				UPDATE canonical_entities c
+				SET embedding = cent.embedding, updated_at = NOW()
+				FROM (
+					SELECT AVG(r.embedding) AS embedding
+					FROM raw_to_canonical l
+					JOIN raw_records r ON r.id = l.raw_record_id
+					WHERE l.canonical_entity_id = $1 AND r.embedding IS NOT NULL
+				) cent
+				WHERE c.id = $1 AND cent.embedding IS NOT NULL`, canonicalID); err != nil {
+				return err
+			}
 		} else if err != pgx.ErrNoRows {
 			return err
 		}

@@ -9,6 +9,17 @@ import (
 
 const pageSize = 25
 
+// Login is the public Firebase bootstrap. It exchanges Google sign-in for a
+// verified ID-token cookie, then navigates to the protected server-rendered app.
+func (a *App) Login(w http.ResponseWriter, r *http.Request) {
+	a.render(w, "login", map[string]any{
+		"FirebaseAPIKey":     a.Cfg.FirebaseAPIKey,
+		"FirebaseAuthDomain": a.Cfg.FirebaseAuthDomain,
+		"FirebaseProjectID":  a.Cfg.FirebaseProjectID,
+		"FirebaseAppID":      a.Cfg.FirebaseAppID,
+	})
+}
+
 type entityListView struct {
 	Entities    []db.CanonicalEntity
 	Total       int
@@ -48,14 +59,18 @@ func (a *App) Index(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	a.render(w, "layout", map[string]any{
-		"User":         user,
-		"Stats":        stats,
-		"Sources":      srcs,
-		"Merges":       merges,
-		"Entities":     list,
-		"AIConfigured": a.AI != nil,
-		"GeminiModel":  a.Cfg.GeminiModel,
-		"AuthMode":     a.Cfg.AuthMode,
+		"User":               user,
+		"Stats":              stats,
+		"Sources":            srcs,
+		"Merges":             merges,
+		"Entities":           list,
+		"AIConfigured":       a.AI != nil,
+		"GeminiModel":        a.Cfg.GeminiModel,
+		"AuthMode":           a.Cfg.AuthMode,
+		"FirebaseAPIKey":     a.Cfg.FirebaseAPIKey,
+		"FirebaseAuthDomain": a.Cfg.FirebaseAuthDomain,
+		"FirebaseProjectID":  a.Cfg.FirebaseProjectID,
+		"FirebaseAppID":      a.Cfg.FirebaseAppID,
 	})
 }
 

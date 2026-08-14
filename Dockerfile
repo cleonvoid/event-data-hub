@@ -8,7 +8,7 @@
 #     event-data-hub
 
 # ---- build stage ----------------------------------------------------------
-FROM golang:1.24-bookworm AS build
+FROM golang:1.26.5-alpine AS build
 
 WORKDIR /src
 

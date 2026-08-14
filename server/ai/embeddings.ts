@@ -19,8 +19,12 @@ export async function embedTexts(texts: string[]): Promise<number[][]> {
   const client = getEmbedClient();
   const out: number[][] = [];
 
-  for (let i = 0; i < texts.length; i += BATCH_SIZE) {
-    const batch = texts.slice(i, i + BATCH_SIZE);
+  const batchSize =
+    config.embeddings.useVertex && config.embeddings.model === "gemini-embedding-001"
+      ? 1
+      : BATCH_SIZE;
+  for (let i = 0; i < texts.length; i += batchSize) {
+    const batch = texts.slice(i, i + batchSize);
 
     const response = await withRetry(`embedTexts[${i}..${i + batch.length})`, () =>
       client.models.embedContent({

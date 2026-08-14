@@ -15,15 +15,22 @@ type Grid struct {
 	Title   string
 	Headers []string
 	Rows    [][]string
+	// RowNumbers[i] is the 1-based line in the original sheet that Rows[i] came
+	// from. It is not i+2: GridFromRows drops fully blank rows, so a blank
+	// separator line partway down shifts every position after it. Reported to
+	// the user and stored on raw_records, so it has to point at the line they
+	// would actually find in the file.
+	RowNumbers []int
 }
 
-// ParseSpreadsheet reads the first sheet of an .xlsx/.csv stream.
+// ParseSpreadsheet reads the first sheet of an .xlsx stream.
 func ParseSpreadsheet(r io.Reader) (*Grid, error) {
 	f, err := excelize.OpenReader(r)
 	if err != nil {
 		return nil, fmt.Errorf("không đọc được tệp bảng tính: %w", err)
 	}
-	defer f.Close()
+	// Nothing is written back, so a close failure cannot lose data.
+	defer func() { _ = f.Close() }()
 
 	sheets := f.GetSheetList()
 	if len(sheets) == 0 {
@@ -42,7 +49,7 @@ func ParseSpreadsheet(r io.Reader) (*Grid, error) {
 // mapping keyed by header name.
 func GridFromRows(title string, rows [][]string) *Grid {
 	if len(rows) == 0 {
-		return &Grid{Title: title, Headers: []string{}, Rows: [][]string{}}
+		return &Grid{Title: title, Headers: []string{}, Rows: [][]string{}, RowNumbers: []int{}}
 	}
 
 	width := len(rows[0])
@@ -71,7 +78,8 @@ func GridFromRows(title string, rows [][]string) *Grid {
 	}
 
 	data := make([][]string, 0, len(rows)-1)
-	for _, r := range rows[1:] {
+	rowNumbers := make([]int, 0, len(rows)-1)
+	for offset, r := range rows[1:] {
 		padded := make([]string, width)
 		nonEmpty := false
 		for i := 0; i < width; i++ {
@@ -84,8 +92,10 @@ func GridFromRows(title string, rows [][]string) *Grid {
 		}
 		if nonEmpty {
 			data = append(data, padded)
+			// +2: the header occupies line 1 and offset is 0-based.
+			rowNumbers = append(rowNumbers, offset+2)
 		}
 	}
 
-	return &Grid{Title: title, Headers: headers, Rows: data}
+	return &Grid{Title: title, Headers: headers, Rows: data, RowNumbers: rowNumbers}
 }

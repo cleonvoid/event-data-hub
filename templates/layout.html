@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="htmx-config" content='{"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"[45]..","swap":true,"error":true},{"code":"...","swap":false}]}'>
   <title>Event Data Hub — Chuẩn hóa &amp; Hợp nhất Dữ liệu Sự kiện</title>
   <!--
     Tailwind + HTMX via CDN: no build step, per the brief.
@@ -26,7 +27,12 @@
     #drawer-host:empty, #modal-host:empty { display: none; }
   </style>
 </head>
-<body class="bg-gray-50 text-gray-900 antialiased">
+<body class="bg-gray-50 text-gray-900 antialiased"
+      data-auth-mode="{{.AuthMode}}"
+      data-firebase-api-key="{{.FirebaseAPIKey}}"
+      data-firebase-auth-domain="{{.FirebaseAuthDomain}}"
+      data-firebase-project-id="{{.FirebaseProjectID}}"
+      data-firebase-app-id="{{.FirebaseAppID}}">
 
 <header class="bg-white border-b border-gray-200 px-6 py-3 flex items-center justify-between sticky top-0 z-30">
   <div class="flex items-center gap-3">
@@ -44,6 +50,10 @@
     {{end}}
     <span class="text-gray-500 hidden md:inline">{{.User.Email}}</span>
     <span class="px-2 py-1 rounded-md bg-gray-100 text-gray-600 font-mono">{{.User.OrganizationID}}</span>
+    {{if eq .AuthMode "firebase"}}
+      <button id="drive-auth" class="px-2.5 py-1 rounded-lg border border-gray-200 hover:bg-gray-50">Cấp lại quyền Drive</button>
+      <button id="sign-out" class="px-2.5 py-1 rounded-lg border border-gray-200 hover:bg-gray-50">Đăng xuất</button>
+    {{end}}
   </div>
 </header>
 
@@ -73,7 +83,7 @@
           class="space-y-2">
           <label class="block">
             <span class="sr-only">Chọn tệp</span>
-            <input type="file" name="file" accept=".xlsx,.xls,.csv" required
+            <input type="file" name="file" accept=".xlsx" required
               class="block w-full text-xs text-gray-600 file:mr-2 file:py-1.5 file:px-3 file:rounded-lg
                      file:border file:border-gray-200 file:text-xs file:font-medium
                      file:bg-white hover:file:bg-gray-50">
@@ -156,6 +166,138 @@
       document.getElementById('modal-host').innerHTML = '';
     }
   });
+
+  // Firebase ID tokens and Google OAuth access tokens are obtained by the
+  // public login screen. HTMX needs both headers on its server requests.
+  document.body.addEventListener('htmx:configRequest', function (e) {
+    const googleToken = sessionStorage.getItem('edh.googleAccessToken');
+    if (googleToken) e.detail.headers['X-Google-Access-Token'] = googleToken;
+  });
 </script>
+{{if eq .AuthMode "firebase"}}
+<script type="module">
+  import { initializeApp, getApps } from 'https://www.gstatic.com/firebasejs/12.17.1/firebase-app.js';
+  import {
+    getAuth, GoogleAuthProvider, onIdTokenChanged, signInWithPopup, signOut
+  } from 'https://www.gstatic.com/firebasejs/12.17.1/firebase-auth.js';
+
+  const d = document.body.dataset;
+  const app = getApps()[0] || initializeApp({
+    apiKey: d.firebaseApiKey,
+    authDomain: d.firebaseAuthDomain,
+    projectId: d.firebaseProjectId,
+    appId: d.firebaseAppId,
+  });
+  const firebaseAuth = getAuth(app);
+  async function establishSession(user) {
+    const response = await fetch('/session', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + await user.getIdToken() },
+    });
+    if (!response.ok) throw new Error(await response.text());
+  }
+
+  // Refreshing the server session is best effort, but its failure must not be
+  // silent: an unhandled rejection here would leave a stale cookie and the user
+  // would only discover it on their next request. Send them back to the login
+  // screen instead.
+  onIdTokenChanged(firebaseAuth, async (user) => {
+    if (!user) return;
+    try {
+      await establishSession(user);
+    } catch (e) {
+      console.error('Không làm mới được phiên đăng nhập:', e);
+      location.assign('/');
+    }
+  });
+
+  document.getElementById('drive-auth').addEventListener('click', async () => {
+    const provider = new GoogleAuthProvider();
+    provider.addScope('https://www.googleapis.com/auth/drive.readonly');
+    provider.addScope('https://www.googleapis.com/auth/spreadsheets.readonly');
+    const result = await signInWithPopup(firebaseAuth, provider);
+    const credential = GoogleAuthProvider.credentialFromResult(result);
+    if (credential?.accessToken) {
+      sessionStorage.setItem('edh.googleAccessToken', credential.accessToken);
+    }
+    await establishSession(result.user);
+  });
+
+  document.getElementById('sign-out').addEventListener('click', async () => {
+    await signOut(firebaseAuth);
+    sessionStorage.removeItem('edh.googleAccessToken');
+    await fetch('/session', { method: 'DELETE' });
+    location.assign('/');
+  });
+</script>
+{{end}}
+</body>
+</html>{{end}}
+
+{{define "login"}}<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Đăng nhập — Event Data Hub</title>
+  <script src="https://cdn.tailwindcss.com/3.4.17"
+    integrity="sha384-igm5BeiBt36UU4gqwWS7imYmelpTsZlQ45FZf+XBn9MuJbn4nQr7yx1yFydocC/K"
+    crossorigin="anonymous"></script>
+</head>
+<body class="min-h-screen bg-gray-50 flex items-center justify-center p-6"
+      data-firebase-api-key="{{.FirebaseAPIKey}}"
+      data-firebase-auth-domain="{{.FirebaseAuthDomain}}"
+      data-firebase-project-id="{{.FirebaseProjectID}}"
+      data-firebase-app-id="{{.FirebaseAppID}}">
+  <main class="w-full max-w-md bg-white border border-gray-200 rounded-2xl p-8 text-center">
+    <div class="w-12 h-12 mx-auto bg-emerald-600 rounded-xl flex items-center justify-center text-white font-bold">EDH</div>
+    <h1 class="mt-4 text-xl font-bold text-gray-900">Event Data Hub</h1>
+    <p class="mt-2 text-sm text-gray-500">Đăng nhập bằng Google để truy cập dữ liệu của tổ chức và chọn bảng tính từ Drive.</p>
+    <button id="sign-in" class="mt-6 w-full bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-xl px-4 py-2.5">
+      Đăng nhập bằng Google
+    </button>
+    <p id="login-error" class="mt-3 text-sm text-red-700" role="alert"></p>
+  </main>
+
+  <script type="module">
+    import { initializeApp } from 'https://www.gstatic.com/firebasejs/12.17.1/firebase-app.js';
+    import { getAuth, GoogleAuthProvider, signInWithPopup } from 'https://www.gstatic.com/firebasejs/12.17.1/firebase-auth.js';
+
+    const d = document.body.dataset;
+    const error = document.getElementById('login-error');
+    const button = document.getElementById('sign-in');
+    if (!d.firebaseApiKey || !d.firebaseProjectId) {
+      button.disabled = true;
+      error.textContent = 'Thiếu VITE_FIREBASE_API_KEY hoặc FIREBASE_PROJECT_ID trên máy chủ.';
+    } else {
+      const auth = getAuth(initializeApp({
+        apiKey: d.firebaseApiKey,
+        authDomain: d.firebaseAuthDomain,
+        projectId: d.firebaseProjectId,
+        appId: d.firebaseAppId,
+      }));
+      button.addEventListener('click', async () => {
+        button.disabled = true;
+        error.textContent = '';
+        try {
+          const provider = new GoogleAuthProvider();
+          provider.addScope('https://www.googleapis.com/auth/drive.readonly');
+          provider.addScope('https://www.googleapis.com/auth/spreadsheets.readonly');
+          const result = await signInWithPopup(auth, provider);
+          const credential = GoogleAuthProvider.credentialFromResult(result);
+          const idToken = await result.user.getIdToken();
+          if (credential?.accessToken) sessionStorage.setItem('edh.googleAccessToken', credential.accessToken);
+          const response = await fetch('/session', {
+            method: 'POST', headers: { Authorization: 'Bearer ' + idToken },
+          });
+          if (!response.ok) throw new Error(await response.text());
+          location.assign('/app');
+        } catch (e) {
+          error.textContent = e instanceof Error ? e.message : String(e);
+          button.disabled = false;
+        }
+      });
+    }
+  </script>
 </body>
 </html>{{end}}
