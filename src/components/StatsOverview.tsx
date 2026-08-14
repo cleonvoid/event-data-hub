@@ -58,13 +58,13 @@ export const StatsOverview: React.FC<{ stats: StatsSummary | null }> = ({ stats 
         </p>
       </div>
 
-      {stats.bySourceType.length > 0 && (
+      {(stats.bySourceType ?? []).length > 0 && (
         <div className="mt-3">
           <h3 className="text-[11px] font-bold text-gray-400 uppercase tracking-wider mb-1.5">
             Theo loại nguồn
           </h3>
           <ul className="space-y-1">
-            {stats.bySourceType.map((s) => (
+            {(stats.bySourceType ?? []).map((s) => (
               <li key={s.sourceType} className="flex items-center justify-between text-xs text-gray-600">
                 <span>{SOURCE_LABELS[s.sourceType] ?? s.sourceType}</span>
                 <span className="text-gray-400">

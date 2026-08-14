@@ -69,13 +69,13 @@ export const EntityDetailDrawer: React.FC<Props> = ({
             </div>
           </div>
 
-          {differingFields.length > 0 && (
+          {(differingFields ?? []).length > 0 && (
             <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 flex items-start gap-2.5">
               <Info className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
               <div className="text-sm text-amber-900">
                 <p className="font-semibold">Các trường khác nhau giữa những bản ghi đã hợp nhất:</p>
                 <p className="text-xs mt-0.5">
-                  {differingFields.map((f) => FIELD_LABELS[f] ?? f).join(", ")}. Đây là biến thể bình
+                  {(differingFields ?? []).map((f) => FIELD_LABELS[f] ?? f).join(", ")}. Đây là biến thể bình
                   thường giữa các tệp, nhưng cũng là dấu hiệu cần kiểm tra nếu bạn nghi ngờ hợp nhất sai.
                 </p>
               </div>
@@ -85,20 +85,20 @@ export const EntityDetailDrawer: React.FC<Props> = ({
           <div>
             <h4 className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2.5 flex items-center gap-2">
               <FileText className="w-4 h-4 text-emerald-600" />
-              Bản ghi nguồn ({records.length})
+              Bản ghi nguồn ({(records ?? []).length})
             </h4>
 
             {loading ? (
               <div className="flex items-center gap-2 text-sm text-gray-500 p-4">
                 <Loader2 className="w-4 h-4 animate-spin" /> Đang tải…
               </div>
-            ) : records.length === 0 ? (
+            ) : (records ?? []).length === 0 ? (
               <p className="text-sm text-gray-400 italic p-4 bg-gray-50 rounded-xl border border-gray-200">
                 Chưa có bản ghi nguồn nào liên kết.
               </p>
             ) : (
               <div className="space-y-2.5">
-                {records.map((rec) => (
+                {(records ?? []).map((rec) => (
                   <div key={rec.id} className="border border-gray-200 rounded-xl p-3.5 space-y-2">
                     <div className="flex items-start justify-between gap-2">
                       <span className="inline-block px-2 py-0.5 rounded-md text-[11px] font-bold bg-blue-50 text-blue-700 truncate">
@@ -127,11 +127,11 @@ export const EntityDetailDrawer: React.FC<Props> = ({
                     )}
 
                     <div className="grid grid-cols-2 gap-x-3 gap-y-1.5 text-xs pt-2 border-t border-gray-100">
-                      <SourceField label="Tên trong nguồn" value={rec.fullName} highlight={differingFields.includes("fullName")} />
-                      <SourceField label="Đơn vị" value={rec.organization} highlight={differingFields.includes("organization")} />
-                      <SourceField label="Chức danh" value={rec.roleTitle} highlight={differingFields.includes("roleTitle")} />
-                      <SourceField label="Email" value={rec.email} highlight={differingFields.includes("email")} />
-                      <SourceField label="Điện thoại" value={rec.phone} highlight={differingFields.includes("phone")} />
+                      <SourceField label="Tên trong nguồn" value={rec.fullName} highlight={(differingFields ?? []).includes("fullName")} />
+                      <SourceField label="Đơn vị" value={rec.organization} highlight={(differingFields ?? []).includes("organization")} />
+                      <SourceField label="Chức danh" value={rec.roleTitle} highlight={(differingFields ?? []).includes("roleTitle")} />
+                      <SourceField label="Email" value={rec.email} highlight={(differingFields ?? []).includes("email")} />
+                      <SourceField label="Điện thoại" value={rec.phone} highlight={(differingFields ?? []).includes("phone")} />
                       {rec.notes && <SourceField label="Ghi chú" value={rec.notes} highlight={false} />}
                     </div>
                   </div>

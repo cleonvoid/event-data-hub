@@ -1,5 +1,29 @@
 import type pg from "pg";
-import { pool, query, vectorScan, vectorToSql } from "./db.js";
+import { pool, query, vectorScan, vectorToSql, isMemoryStoreActive } from "./db.js";
+import {
+  memoryCreateSource,
+  memoryListSources,
+  memoryInsertRawRecord,
+  memoryGetRawRecordsForEntity,
+  memoryGetRawRecordById,
+  memoryGetEmbeddingsForEntity,
+  memoryCreateCanonicalEntity,
+  memoryLinkRecordToEntity,
+  memoryUpdateEntityCentroid,
+  memoryEnrichEntityFromRecord,
+  memoryListEntities,
+  memoryGetEntityById,
+  memoryFindCandidateEntitiesByVector,
+  memoryFindCandidateEntitiesByIdentifier,
+  memoryInsertMergeSuggestion,
+  memoryListPendingSuggestions,
+  memoryGetSuggestionForUpdate,
+  memorySetSuggestionStatus,
+  memoryMarkAutoRejected,
+  memoryRejectSupersededSuggestions,
+  memoryReassignRecordToEntity,
+  memoryGetStats,
+} from "./memory-store.js";
 import {
   eventCountSubquery,
   recordCountSubquery,
@@ -86,13 +110,16 @@ export async function createSource(
   input: {
     organizationId: string;
     name: string;
-    sourceType: string;
+    sourceType: SourceRow["sourceType"];
     externalFileId: string | null;
     importedBy: string;
     fieldMapping: Record<string, string>;
   },
   client?: Executor,
 ): Promise<string> {
+  if (isMemoryStoreActive()) {
+    return memoryCreateSource(input);
+  }
   const res = await db(client).query<{ id: string }>(
     `INSERT INTO sources (organization_id, name, source_type, external_file_id, imported_by, field_mapping)
      VALUES ($1, $2, $3, $4, $5, $6)
@@ -110,6 +137,9 @@ export async function createSource(
 }
 
 export async function listSources(organizationId: string): Promise<SourceRow[]> {
+  if (isMemoryStoreActive()) {
+    return memoryListSources(organizationId);
+  }
   const res = await query(
     `SELECT s.id, s.organization_id, s.name, s.source_type, s.external_file_id, s.imported_at,
             (SELECT COUNT(*) FROM raw_records r WHERE r.source_id = s.id) AS records_count
@@ -152,6 +182,9 @@ export interface NewRawRecord {
 }
 
 export async function insertRawRecord(rec: NewRawRecord, client?: Executor): Promise<string> {
+  if (isMemoryStoreActive()) {
+    return memoryInsertRawRecord(rec);
+  }
   const res = await db(client).query<{ id: string }>(
     `INSERT INTO raw_records (
        source_id, organization_id, row_number, raw_data,
@@ -185,6 +218,9 @@ export async function getRawRecordsForEntity(
   organizationId: string,
   entityId: string,
 ): Promise<RawRecordRow[]> {
+  if (isMemoryStoreActive()) {
+    return memoryGetRawRecordsForEntity(organizationId, entityId);
+  }
   const res = await query(
     `SELECT r.*, s.name AS source_name, s.source_type
      FROM raw_to_canonical l
@@ -202,6 +238,9 @@ export async function getRawRecordById(
   recordId: string,
   client?: Executor,
 ): Promise<RawRecordRow | null> {
+  if (isMemoryStoreActive()) {
+    return memoryGetRawRecordById(organizationId, recordId);
+  }
   const res = await db(client).query(
     `SELECT r.*, s.name AS source_name, s.source_type
      FROM raw_records r
@@ -217,6 +256,9 @@ export async function getEmbeddingsForEntity(
   entityId: string,
   client?: Executor,
 ): Promise<number[][]> {
+  if (isMemoryStoreActive()) {
+    return memoryGetEmbeddingsForEntity(entityId);
+  }
   const res = await db(client).query<{ embedding: string | null }>(
     `SELECT r.embedding::text AS embedding
      FROM raw_to_canonical l
@@ -246,6 +288,9 @@ export async function createCanonicalEntity(
   },
   client?: Executor,
 ): Promise<string> {
+  if (isMemoryStoreActive()) {
+    return memoryCreateCanonicalEntity(input);
+  }
   const res = await db(client).query<{ id: string }>(
     `INSERT INTO canonical_entities (
        organization_id, entity_type, display_name,
@@ -275,6 +320,9 @@ export async function linkRecordToEntity(
   },
   client?: Executor,
 ): Promise<void> {
+  if (isMemoryStoreActive()) {
+    return memoryLinkRecordToEntity(input);
+  }
   await db(client).query(
     `INSERT INTO raw_to_canonical (raw_record_id, canonical_entity_id, organization_id, link_method)
      VALUES ($1,$2,$3,$4)
@@ -288,6 +336,9 @@ export async function updateEntityCentroid(
   embedding: number[],
   client?: Executor,
 ): Promise<void> {
+  if (isMemoryStoreActive()) {
+    return memoryUpdateEntityCentroid(entityId, embedding);
+  }
   await db(client).query(
     `UPDATE canonical_entities SET embedding = $2::vector, updated_at = NOW() WHERE id = $1`,
     [entityId, vectorToSql(embedding)],
@@ -303,6 +354,9 @@ export async function enrichEntityFromRecord(
   record: RawRecordRow,
   client?: Executor,
 ): Promise<void> {
+  if (isMemoryStoreActive()) {
+    return memoryEnrichEntityFromRecord(entityId, record);
+  }
   await db(client).query(
     `UPDATE canonical_entities SET
        primary_email        = COALESCE(NULLIF(primary_email, ''), NULLIF($2, '')),
@@ -326,6 +380,9 @@ export async function listEntities(
   organizationId: string,
   opts: ListEntitiesOptions,
 ): Promise<{ entities: CanonicalEntityRow[]; total: number }> {
+  if (isMemoryStoreActive()) {
+    return memoryListEntities(organizationId, opts);
+  }
   const where = opts.predicateSql ? `AND (${opts.predicateSql})` : "";
   const params: (string | number)[] = [organizationId, ...(opts.predicateParams ?? [])];
 
@@ -354,6 +411,9 @@ export async function getEntityById(
   entityId: string,
   client?: Executor,
 ): Promise<CanonicalEntityRow | null> {
+  if (isMemoryStoreActive()) {
+    return memoryGetEntityById(organizationId, entityId);
+  }
   const res = await db(client).query(
     `SELECT ${ENTITY_COLUMNS} FROM canonical_entities c WHERE c.id = $1 AND c.organization_id = $2`,
     [entityId, organizationId],
@@ -374,19 +434,6 @@ export interface CandidateEntity {
 
 /**
  * Stage 1 — pgvector cosine retrieval.
- *
- * `<=>` is cosine distance; embeddings are unit-normalised on write, so
- * similarity = 1 - distance is plain cosine similarity in [-1, 1].
- *
- * The NOT EXISTS against merge_suggestions is the negative signal: any pair that
- * already has a suggestion row — pending, approved, or REJECTED — is excluded,
- * so a rejected pair can never be proposed to the user a second time.
- *
- * Neither that anti-join nor the organization_id filter is visible to the HNSW
- * index, so pgvector applies both only after the approximate scan has picked its
- * tuples. Run through vectorScan, which widens the scan first — otherwise a
- * database holding many tenants can return the querying tenant nothing at all,
- * because every one of the nearest entities belonged to somebody else.
  */
 export async function findCandidateEntitiesByVector(
   organizationId: string,
@@ -395,6 +442,9 @@ export async function findCandidateEntitiesByVector(
   topN: number,
   client?: Executor,
 ): Promise<CandidateEntity[]> {
+  if (isMemoryStoreActive()) {
+    return memoryFindCandidateEntitiesByVector(organizationId, rawRecordId, embedding, topN);
+  }
   const res = await vectorScan(
     `SELECT ${ENTITY_COLUMNS},
             1 - (c.embedding <=> $2::vector) AS similarity
@@ -419,10 +469,7 @@ export async function findCandidateEntitiesByVector(
 }
 
 /**
- * Deterministic blocking on exact email / phone match, unioned into the Stage 1
- * candidate set. Cosine distance over "name | org | role" cannot see an email at
- * all, so a person who changed employer AND job title would otherwise be missed
- * despite having an unambiguous identifier in the data.
+ * Deterministic blocking on exact email / phone match, unioned into the Stage 1 candidate set.
  */
 export async function findCandidateEntitiesByIdentifier(
   organizationId: string,
@@ -431,6 +478,9 @@ export async function findCandidateEntitiesByIdentifier(
   phone: string,
   client?: Executor,
 ): Promise<CandidateEntity[]> {
+  if (isMemoryStoreActive()) {
+    return memoryFindCandidateEntitiesByIdentifier(organizationId, rawRecordId, email, phone);
+  }
   if (!email && !phone) return [];
   const res = await db(client).query(
     `SELECT ${ENTITY_COLUMNS}
@@ -450,7 +500,7 @@ export async function findCandidateEntitiesByIdentifier(
   );
   return res.rows.map((r) => ({
     entity: mapEntity(r),
-    similarity: 1,
+    similarity: 1.0,
     viaBlocking: true,
   }));
 }
@@ -472,15 +522,16 @@ export async function insertMergeSuggestion(
   },
   client?: Executor,
 ): Promise<boolean> {
-  // ON CONFLICT DO NOTHING against the unique (entity, record) index: if this
-  // pair was ever suggested before — including a rejection — nothing happens.
+  if (isMemoryStoreActive()) {
+    return memoryInsertMergeSuggestion(input);
+  }
   const res = await db(client).query(
     `INSERT INTO merge_suggestions (
        organization_id, canonical_entity_id, candidate_raw_record_id,
-       vector_similarity, llm_confidence, combined_confidence, llm_verdict, reasoning
+       vector_similarity, llm_confidence, combined_confidence,
+       llm_verdict, reasoning
      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-     ON CONFLICT (canonical_entity_id, candidate_raw_record_id) DO NOTHING
-     RETURNING id`,
+     ON CONFLICT (canonical_entity_id, candidate_raw_record_id) DO NOTHING`,
     [
       input.organizationId,
       input.canonicalEntityId,
@@ -499,6 +550,9 @@ export async function listPendingSuggestions(
   organizationId: string,
   limit = 50,
 ): Promise<MergeSuggestionRow[]> {
+  if (isMemoryStoreActive()) {
+    return memoryListPendingSuggestions(organizationId, limit);
+  }
   const res = await query(
     `SELECT ms.id, ms.canonical_entity_id, ms.candidate_raw_record_id,
             ms.vector_similarity, ms.llm_confidence, ms.combined_confidence,
@@ -545,6 +599,9 @@ export async function getSuggestionForUpdate(
   candidateRawRecordId: string;
   status: string;
 } | null> {
+  if (isMemoryStoreActive()) {
+    return memoryGetSuggestionForUpdate(organizationId, suggestionId);
+  }
   const res = await client.query(
     `SELECT id, canonical_entity_id, candidate_raw_record_id, status
      FROM merge_suggestions
@@ -567,13 +624,48 @@ export async function setSuggestionStatus(
   suggestionId: string,
   status: "approved" | "rejected",
   decidedBy: string,
-  client: Executor,
+  client?: Executor,
 ): Promise<void> {
-  await client.query(
+  if (isMemoryStoreActive()) {
+    return memorySetSuggestionStatus(suggestionId, status, decidedBy);
+  }
+  await db(client).query(
     `UPDATE merge_suggestions
      SET status = $2, decided_at = NOW(), decided_by = $3
      WHERE id = $1`,
     [suggestionId, status, decidedBy],
+  );
+}
+
+export async function markAutoRejected(
+  canonicalEntityId: string,
+  candidateRawRecordId: string,
+  client?: Executor,
+): Promise<void> {
+  if (isMemoryStoreActive()) {
+    return memoryMarkAutoRejected(canonicalEntityId, candidateRawRecordId);
+  }
+  await db(client).query(
+    `UPDATE merge_suggestions
+     SET status = 'rejected', decided_at = NOW(), decided_by = 'gemini_stage2'
+     WHERE canonical_entity_id = $1 AND candidate_raw_record_id = $2 AND status = 'pending'`,
+    [canonicalEntityId, candidateRawRecordId],
+  );
+}
+
+export async function rejectSupersededSuggestions(
+  candidateRawRecordId: string,
+  excludeSuggestionId: string,
+  client?: Executor,
+): Promise<void> {
+  if (isMemoryStoreActive()) {
+    return memoryRejectSupersededSuggestions(candidateRawRecordId, excludeSuggestionId);
+  }
+  await db(client).query(
+    `UPDATE merge_suggestions
+     SET status = 'rejected', decided_at = NOW(), decided_by = 'superseded'
+     WHERE candidate_raw_record_id = $1 AND status = 'pending' AND id <> $2`,
+    [candidateRawRecordId, excludeSuggestionId],
   );
 }
 
@@ -586,6 +678,9 @@ export async function reassignRecordToEntity(
   input: { rawRecordId: string; targetEntityId: string; organizationId: string },
   client: Executor,
 ): Promise<{ removedEntityId: string | null }> {
+  if (isMemoryStoreActive()) {
+    return memoryReassignRecordToEntity(input);
+  }
   const current = await client.query<{ canonical_entity_id: string }>(
     `SELECT canonical_entity_id FROM raw_to_canonical WHERE raw_record_id = $1`,
     [input.rawRecordId],
@@ -622,6 +717,9 @@ export async function reassignRecordToEntity(
 // ---------------------------------------------------------------------------
 
 export async function getStats(organizationId: string): Promise<StatsSummary> {
+  if (isMemoryStoreActive()) {
+    return memoryGetStats(organizationId);
+  }
   const res = await query<{
     total_entities: string;
     total_raw: string;
@@ -659,7 +757,6 @@ export async function getStats(organizationId: string): Promise<StatsSummary> {
   return {
     totalCanonicalEntities: totalEntities,
     totalRawRecords: totalRaw,
-    // Raw-only rows cannot be deduplicated, so only count linked records.
     dedupRatePercent:
       linkedRaw > 0 ? Number((((linkedRaw - totalEntities) / linkedRaw) * 100).toFixed(1)) : 0,
     sourceFilesProcessed: Number(res.rows[0]?.total_sources ?? 0),

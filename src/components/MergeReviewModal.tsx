@@ -102,7 +102,7 @@ export const MergeReviewModal: React.FC<Props> = ({
         </div>
 
         <div className="p-5 max-h-[70vh] overflow-y-auto space-y-4">
-          {suggestions.length === 0 ? (
+          {(suggestions ?? []).length === 0 ? (
             <div className="text-center py-12">
               <div className="w-14 h-14 bg-emerald-50 text-emerald-600 rounded-full flex items-center justify-center mx-auto mb-3">
                 <CheckCircle2 className="w-7 h-7" />
@@ -113,9 +113,26 @@ export const MergeReviewModal: React.FC<Props> = ({
               </p>
             </div>
           ) : (
-            suggestions.map((s) => {
-              const entity = s.canonicalEntity;
-              const record = s.candidateRecord;
+            (suggestions ?? []).map((s) => {
+              const entity = s.canonicalEntity ?? {
+                displayName: "Không rõ",
+                primaryEmail: null,
+                primaryPhone: null,
+                primaryOrganization: null,
+                primaryRole: null,
+                eventCount: 0,
+                sourceFileCount: 0,
+              };
+              const record = s.candidateRecord ?? {
+                sourceName: "Nguồn không rõ",
+                fullName: null,
+                organization: null,
+                roleTitle: null,
+                email: null,
+                phone: null,
+                eventName: null,
+                eventDate: null,
+              };
               const busy = busyId === s.id;
 
               return (

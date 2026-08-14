@@ -47,10 +47,10 @@ export const Toasts: React.FC<{ toasts: Toast[]; dismiss: (id: number) => void }
   toasts,
   dismiss,
 }) => {
-  if (toasts.length === 0) return null;
+  if ((toasts ?? []).length === 0) return null;
   return (
     <div className="fixed top-4 right-4 z-[100] space-y-2 w-full max-w-md pointer-events-none">
-      {toasts.map((t) => {
+      {(toasts ?? []).map((t) => {
         const style = STYLES[t.kind];
         const { Icon } = style;
         return (

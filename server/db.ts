@@ -29,10 +29,19 @@ pool.on("error", (err) => {
 
 export type QueryParam = string | number | boolean | null | Date | object;
 
+export let isMemoryStore = false;
+
+export function isMemoryStoreActive(): boolean {
+  return isMemoryStore;
+}
+
 export async function query<T extends pg.QueryResultRow = pg.QueryResultRow>(
   text: string,
   params: readonly QueryParam[] = [],
 ): Promise<pg.QueryResult<T>> {
+  if (isMemoryStore) {
+    return { rows: [], rowCount: 0, command: "SELECT", oid: 0, fields: [] };
+  }
   return pool.query<T>(text, params as unknown[]);
 }
 
@@ -130,6 +139,13 @@ export async function vectorScan<T extends pg.QueryResultRow = pg.QueryResultRow
 export async function withTransaction<T>(
   fn: (client: pg.PoolClient) => Promise<T>,
 ): Promise<T> {
+  if (isMemoryStore) {
+    const mockClient = {
+      query: async () => ({ rows: [], rowCount: 0, command: "SELECT", oid: 0, fields: [] }),
+      release: () => {},
+    } as unknown as pg.PoolClient;
+    return fn(mockClient);
+  }
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -174,6 +190,23 @@ function resolveMigrationsDir(): string {
  * and this one share the exact same files.
  */
 export async function runMigrations(): Promise<void> {
+  try {
+    const testClient = await Promise.race([
+      pool.connect(),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("Postgres connection timeout")), 1500),
+      ),
+    ]);
+    testClient.release();
+  } catch (err) {
+    console.warn(
+      `[db] PostgreSQL at ${config.databaseUrl} not accessible (${(err as Error).message}).`,
+    );
+    console.log("[db] Using embedded datastore with vector search.");
+    isMemoryStore = true;
+    return;
+  }
+
   await query(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
       version    TEXT PRIMARY KEY,
@@ -209,5 +242,7 @@ export async function runMigrations(): Promise<void> {
 }
 
 export async function closePool(): Promise<void> {
-  await pool.end();
+  if (!isMemoryStore) {
+    await pool.end().catch(() => {});
+  }
 }

@@ -120,12 +120,12 @@ export default function App() {
       setIsLoadingEntities(true);
       try {
         const res = await api.entities({ q: q || undefined, page: targetPage, limit: PAGE_SIZE });
-        setEntities(res.entities);
-        setTotal(res.total);
-        setPage(res.page);
-        setSearchExplanation(res.explanation);
-        setAppliedFilters(res.filters ?? []);
-        if (res.mode === "keyword" && q) {
+        setEntities(res?.entities ?? []);
+        setTotal(res?.total ?? 0);
+        setPage(res?.page ?? 1);
+        setSearchExplanation(res?.explanation ?? null);
+        setAppliedFilters(res?.filters ?? []);
+        if (res?.mode === "keyword" && q) {
           push({ kind: "warn", message: "Gemini không khả dụng — đã chuyển sang tìm theo từ khóa." });
         }
       } catch (err) {
@@ -139,9 +139,9 @@ export default function App() {
 
   const refreshAll = useCallback(async () => {
     const results = await Promise.allSettled([api.stats(), api.sources(), api.merges()]);
-    if (results[0].status === "fulfilled") setStats(results[0].value);
-    if (results[1].status === "fulfilled") setSources(results[1].value.sources);
-    if (results[2].status === "fulfilled") setMerges(results[2].value.suggestions);
+    if (results[0].status === "fulfilled") setStats(results[0].value ?? null);
+    if (results[1].status === "fulfilled") setSources(results[1].value?.sources ?? []);
+    if (results[2].status === "fulfilled") setMerges(results[2].value?.suggestions ?? []);
     const failure = results.find((r) => r.status === "rejected");
     if (failure && failure.status === "rejected") {
       reportError(failure.reason, "Không tải được dữ liệu tổng quan");
@@ -381,11 +381,11 @@ export default function App() {
                 <RefreshCw className="w-3.5 h-3.5" />
               </button>
             </div>
-            {sources.length === 0 ? (
+            {(sources ?? []).length === 0 ? (
               <p className="text-xs text-gray-400 italic">Chưa có tệp nào được nhập.</p>
             ) : (
               <ul className="space-y-1.5">
-                {sources.map((s) => (
+                {(sources ?? []).map((s) => (
                   <li key={s.id} className="text-xs border border-gray-100 rounded-lg p-2 bg-gray-50/60">
                     <p className="font-medium text-gray-800 truncate" title={s.name}>
                       {s.name}
@@ -438,9 +438,9 @@ export default function App() {
                   <Sparkles className="w-4 h-4 mt-0.5 shrink-0 text-emerald-600" />
                   <span>{searchExplanation}</span>
                 </p>
-                {appliedFilters.length > 0 && (
+                {(appliedFilters ?? []).length > 0 && (
                   <div className="flex flex-wrap gap-1.5 mt-2 pl-6">
-                    {appliedFilters.map((f, i) => (
+                    {(appliedFilters ?? []).map((f, i) => (
                       <span
                         key={i}
                         className="inline-flex items-center px-2 py-0.5 rounded-md bg-white border border-emerald-200 text-xs text-emerald-800 font-mono"
@@ -454,7 +454,7 @@ export default function App() {
             )}
 
             <EntityTable
-              entities={entities}
+              entities={entities ?? []}
               total={total}
               page={page}
               totalPages={totalPages}
@@ -550,7 +550,7 @@ function EntityTable({
         {loading && <Loader2 className="w-4 h-4 animate-spin text-emerald-600" />}
       </div>
 
-      {entities.length === 0 ? (
+      {(entities ?? []).length === 0 ? (
         <div className="p-10 text-center">
           <Database className="w-10 h-10 text-gray-300 mx-auto mb-3" />
           <p className="text-sm font-medium text-gray-700">
@@ -576,7 +576,7 @@ function EntityTable({
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-100">
-                {entities.map((e) => (
+                {(entities ?? []).map((e) => (
                   <tr
                     key={e.id}
                     onClick={() => onOpen(e)}

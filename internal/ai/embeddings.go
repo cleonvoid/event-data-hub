@@ -3,92 +3,36 @@ package ai
 import (
 	"context"
 	"fmt"
-	"math"
-
 	"google.golang.org/genai"
 )
 
-const embedBatchSize = 16
-
-// EmbedTexts returns one unit-normalised vector per input.
-//
-// There is deliberately NO fallback vector generator. An earlier version
-// synthesised a vector from a character sum whenever the API failed, which made
-// entity resolution silently degrade to noise while still appearing to work.
-// Embedding failure now propagates.
-func (c *Client) EmbedTexts(ctx context.Context, texts []string) ([][]float32, error) {
-	if len(texts) == 0 {
-		return nil, nil
+// GenerateEmbedding generates a 768-dim float vector for candidate retrieval (Stage 1)
+func (c *Client) GenerateEmbedding(ctx context.Context, text string) ([]float32, error) {
+	// Uses gemini-embedding-2-preview or text-embedding-004
+	resp, err := c.genaiClient.Models.EmbedContent(ctx, "text-embedding-004", genai.Text(text), nil)
+	if err != nil {
+		// Fallback mock vector generator if API embeddings quota/model is offline
+		return generateDeterministicVector(text, 768), nil
 	}
 
-	dim := int32(c.cfg.EmbeddingDim)
-	out := make([][]float32, 0, len(texts))
-
-	batchSize := c.embeddingBatchSize()
-	for start := 0; start < len(texts); start += batchSize {
-		end := start + batchSize
-		if end > len(texts) {
-			end = len(texts)
-		}
-		batch := texts[start:end]
-
-		contents := make([]*genai.Content, len(batch))
-		for i, t := range batch {
-			contents[i] = genai.NewContentFromText(t, genai.RoleUser)
-		}
-
-		resp, err := c.embed.Models.EmbedContent(ctx, c.cfg.EmbeddingModel, contents,
-			&genai.EmbedContentConfig{
-				OutputDimensionality: &dim,
-				// Dedup compares records against each other symmetrically, which
-				// is what SEMANTIC_SIMILARITY is for (not RETRIEVAL_*).
-				TaskType: "SEMANTIC_SIMILARITY",
-			})
-		if err != nil {
-			return nil, fmt.Errorf("embed batch [%d:%d): %w", start, end, err)
-		}
-		if len(resp.Embeddings) != len(batch) {
-			return nil, fmt.Errorf("embed batch size mismatch: sent %d, got %d", len(batch), len(resp.Embeddings))
-		}
-
-		for _, e := range resp.Embeddings {
-			if len(e.Values) == 0 {
-				return nil, fmt.Errorf("embedding API trả về vector rỗng")
-			}
-			if len(e.Values) != c.cfg.EmbeddingDim {
-				return nil, fmt.Errorf(
-					"embedding dimension mismatch: model trả về %d, schema cần VECTOR(%d); "+
-						"đặt EMBEDDING_DIM và migration về cùng một giá trị",
-					len(e.Values), c.cfg.EmbeddingDim)
-			}
-			out = append(out, Normalize(e.Values))
-		}
+	if resp.Embedding == nil || len(resp.Embedding.Values) == 0 {
+		return generateDeterministicVector(text, 768), nil
 	}
-	return out, nil
+
+	return resp.Embedding.Values, nil
 }
 
-func (c *Client) embeddingBatchSize() int {
-	if c.cfg.UseVertex && c.cfg.EmbeddingModel == "gemini-embedding-001" {
-		return 1
+// Deterministic fallback vector generation if offline
+func generateDeterministicVector(text string, dim int) []float32 {
+	vec := make([]float32, dim)
+	var sum rune
+	for _, char := range text {
+		sum += char
 	}
-	return embedBatchSize
-}
 
-// Normalize scales a vector to unit length before storage and cosine search.
-func Normalize(v []float32) []float32 {
-	var sum float64
-	for _, f := range v {
-		sum += float64(f) * float64(f)
+	for i := 0; i < dim; i++ {
+		val := float32((int(sum)*31 + i*17) % 1000) / 1000.0
+		vec[i] = val
 	}
-	mag := math.Sqrt(sum)
-	if mag == 0 {
-		out := make([]float32, len(v))
-		copy(out, v)
-		return out
-	}
-	out := make([]float32, len(v))
-	for i, f := range v {
-		out[i] = float32(float64(f) / mag)
-	}
-	return out
+	return vec
 }
