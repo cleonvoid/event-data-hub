@@ -1,78 +1,126 @@
+// Package auth verifies Firebase ID tokens.
+//
+// This replaces an earlier "middleware" that base64-decoded nothing, checked no
+// signature, and fell through to a hardcoded org id on every request — a
+// complete auth bypass. VerifyIDToken below checks the RS256 signature against
+// Google's rotating public keys and validates issuer, audience and expiry.
 package auth
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
+
+	firebase "firebase.google.com/go/v4"
+	firebaseauth "firebase.google.com/go/v4/auth"
+
+	"event-data-hub/internal/config"
 )
 
-type contextKey string
+type ctxKey string
 
-const UserOrgKey contextKey = "user_org_id"
-const UserEmailKey contextKey = "user_email"
+const userKey ctxKey = "edh_user"
 
-// TokenPayload represents a simplified decoded Firebase JWT
-type TokenPayload struct {
-	UID            string `json:"sub"`
-	Email          string `json:"email"`
-	OrganizationID string `json:"org_id"`
+type User struct {
+	UID            string
+	Email          string
+	OrganizationID string
 }
 
-// Middleware verifies Authorization: Bearer <token>
-func Middleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		authHeader := r.Header.Get("Authorization")
-		orgID := "org_default_vn"
-		userEmail := "admin@sukiensat.gov.vn"
+type Middleware struct {
+	cfg    config.Config
+	client *firebaseauth.Client
+}
 
-		if authHeader != "" {
-			parts := strings.Split(authHeader, " ")
-			if len(parts) == 2 && parts[0] == "Bearer" {
-				token := parts[1]
-				// Decode header/payload for token inspection
-				payload, err := parseUnverifiedPayload(token)
-				if err == nil {
-					if payload.OrganizationID != "" {
-						orgID = payload.OrganizationID
-					}
-					if payload.Email != "" {
-						userEmail = payload.Email
-					}
-				}
-			}
+// New prepares the middleware. In firebase mode it initialises the Admin SDK;
+// VerifyIDToken only needs the project id, since it fetches Google's public
+// signing certificates over HTTPS.
+func New(ctx context.Context, cfg config.Config) (*Middleware, error) {
+	if cfg.AuthMode == "dev" {
+		if cfg.IsProduction {
+			return nil, errors.New("AUTH_MODE=dev bị từ chối khi chạy production; đặt AUTH_MODE=firebase và FIREBASE_PROJECT_ID")
+		}
+		return &Middleware{cfg: cfg}, nil
+	}
+
+	if cfg.FirebaseProjectID == "" {
+		return nil, errors.New("AUTH_MODE=firebase cần FIREBASE_PROJECT_ID")
+	}
+	app, err := firebase.NewApp(ctx, &firebase.Config{ProjectID: cfg.FirebaseProjectID})
+	if err != nil {
+		return nil, fmt.Errorf("khởi tạo Firebase: %w", err)
+	}
+	client, err := app.Auth(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("khởi tạo Firebase Auth: %w", err)
+	}
+	return &Middleware{cfg: cfg, client: client}, nil
+}
+
+// Wrap rejects unauthenticated requests with 401 instead of falling through.
+func (m *Middleware) Wrap(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if m.cfg.AuthMode == "dev" {
+			ctx := context.WithValue(r.Context(), userKey, User{
+				UID:            "dev-user",
+				Email:          m.cfg.DevEmail,
+				OrganizationID: m.cfg.DevOrgID,
+			})
+			next.ServeHTTP(w, r.WithContext(ctx))
+			return
 		}
 
-		ctx := context.WithValue(r.Context(), UserOrgKey, orgID)
-		ctx = context.WithValue(ctx, UserEmailKey, userEmail)
+		header := r.Header.Get("Authorization")
+		parts := strings.SplitN(header, " ", 2)
+		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || strings.TrimSpace(parts[1]) == "" {
+			http.Error(w, "Thiếu Firebase ID token (Authorization: Bearer <token>)", http.StatusUnauthorized)
+			return
+		}
+
+		token, err := m.client.VerifyIDToken(r.Context(), strings.TrimSpace(parts[1]))
+		if err != nil {
+			// 401 rather than 500: the client should re-authenticate.
+			http.Error(w, "Firebase ID token không hợp lệ: "+err.Error(), http.StatusUnauthorized)
+			return
+		}
+
+		email, _ := token.Claims["email"].(string)
+		ctx := context.WithValue(r.Context(), userKey, User{
+			UID:            token.UID,
+			Email:          email,
+			OrganizationID: deriveOrganizationID(token.Claims, email),
+		})
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
-func parseUnverifiedPayload(token string) (*TokenPayload, error) {
-	parts := strings.Split(token, ".")
-	if len(parts) < 2 {
-		return nil, fmt.Errorf("invalid jwt format")
-	}
+var orgSanitize = regexp.MustCompile(`[^a-z0-9.-]`)
 
-	payloadBytes, err := decodeBase64URL(parts[1])
-	if err != nil {
-		return nil, err
+// deriveOrganizationID picks the tenant key. A custom claim wins; otherwise
+// everyone on the same email domain shares an organization, which is the right
+// default for the public-sector users in the brief.
+func deriveOrganizationID(claims map[string]any, email string) string {
+	for _, key := range []string{"org_id", "organization_id"} {
+		if v, ok := claims[key].(string); ok && strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
 	}
-
-	var payload TokenPayload
-	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
-		return nil, err
+	if at := strings.LastIndex(email, "@"); at >= 0 && at+1 < len(email) {
+		domain := orgSanitize.ReplaceAllString(strings.ToLower(email[at+1:]), "")
+		if domain != "" {
+			return "org_" + domain
+		}
 	}
-	return &payload, nil
+	return "org_unknown"
 }
 
-func decodeBase64URL(s string) ([]byte, error) {
-	if l := len(s) % 4; l > 0 {
-		s += strings.Repeat("=", 4-l)
-	}
-	s = strings.ReplaceAll(s, "-", "+")
-	s = strings.ReplaceAll(s, "_", "/")
-	return []byte(s), nil
+// FromContext returns the authenticated user. ok is false only if this is
+// called outside the middleware, which is a programming error rather than an
+// auth failure.
+func FromContext(ctx context.Context) (User, bool) {
+	u, ok := ctx.Value(userKey).(User)
+	return u, ok
 }

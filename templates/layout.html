@@ -1,0 +1,161 @@
+{{define "layout"}}<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Event Data Hub — Chuẩn hóa &amp; Hợp nhất Dữ liệu Sự kiện</title>
+  <!--
+    Tailwind + HTMX via CDN: no build step, per the brief.
+    Both are pinned to an exact version and carry a Subresource Integrity hash,
+    so a compromised or mutated CDN response is rejected by the browser rather
+    than executed. Regenerate a hash after changing a version:
+      curl -sL <url> | openssl dgst -sha384 -binary | openssl base64 -A
+  -->
+  <script
+    src="https://cdn.tailwindcss.com/3.4.17"
+    integrity="sha384-igm5BeiBt36UU4gqwWS7imYmelpTsZlQ45FZf+XBn9MuJbn4nQr7yx1yFydocC/K"
+    crossorigin="anonymous"></script>
+  <script
+    src="https://unpkg.com/htmx.org@2.0.10/dist/htmx.min.js"
+    integrity="sha384-H5SrcfygHmAuTDZphMHqBJLc3FhssKjG7w/CeCpFReSfwBWDTKpkzPP8c+cLsK+V"
+    crossorigin="anonymous"></script>
+  <style>
+    /* hx-indicator: hidden by default, shown only while its request is in flight. */
+    .htmx-indicator { opacity: 0; transition: opacity 150ms ease-in; }
+    .htmx-request .htmx-indicator, .htmx-request.htmx-indicator { opacity: 1; }
+    #drawer-host:empty, #modal-host:empty { display: none; }
+  </style>
+</head>
+<body class="bg-gray-50 text-gray-900 antialiased">
+
+<header class="bg-white border-b border-gray-200 px-6 py-3 flex items-center justify-between sticky top-0 z-30">
+  <div class="flex items-center gap-3">
+    <div class="w-9 h-9 bg-emerald-600 rounded-lg flex items-center justify-center text-white font-bold text-sm">EDH</div>
+    <div>
+      <h1 class="text-base font-bold leading-tight">Event Data Hub</h1>
+      <p class="text-xs text-gray-500">Chuẩn hóa &amp; Hợp nhất Dữ liệu Sự kiện</p>
+    </div>
+  </div>
+  <div class="flex items-center gap-3 text-xs">
+    {{if not .AIConfigured}}
+      <span class="px-2.5 py-1 rounded-lg bg-amber-50 text-amber-800 border border-amber-200 font-medium">
+        Chưa cấu hình GEMINI_API_KEY
+      </span>
+    {{end}}
+    <span class="text-gray-500 hidden md:inline">{{.User.Email}}</span>
+    <span class="px-2 py-1 rounded-md bg-gray-100 text-gray-600 font-mono">{{.User.OrganizationID}}</span>
+  </div>
+</header>
+
+<div class="flex min-h-[calc(100vh-57px)]">
+
+  <!-- Sidebar: sources, stats, import actions -->
+  <aside class="w-72 bg-white border-r border-gray-200 p-4 space-y-6 shrink-0 hidden lg:block">
+    <section>
+      <h2 class="text-xs font-bold text-gray-400 uppercase tracking-wider mb-2">Nhập dữ liệu</h2>
+      <div class="space-y-2">
+        <button
+          hx-get="/fragments/drive"
+          hx-target="#modal-host"
+          hx-swap="innerHTML"
+          hx-indicator="#drive-spinner"
+          class="w-full flex items-center justify-between gap-2 px-3 py-2 rounded-lg border border-gray-200 text-sm font-medium hover:bg-gray-50">
+          <span>Chọn từ Google Drive</span>
+          <span id="drive-spinner" class="htmx-indicator text-emerald-600">●</span>
+        </button>
+
+        <form
+          hx-post="/import/preview/upload"
+          hx-encoding="multipart/form-data"
+          hx-target="#modal-host"
+          hx-swap="innerHTML"
+          hx-indicator="#upload-spinner"
+          class="space-y-2">
+          <label class="block">
+            <span class="sr-only">Chọn tệp</span>
+            <input type="file" name="file" accept=".xlsx,.xls,.csv" required
+              class="block w-full text-xs text-gray-600 file:mr-2 file:py-1.5 file:px-3 file:rounded-lg
+                     file:border file:border-gray-200 file:text-xs file:font-medium
+                     file:bg-white hover:file:bg-gray-50">
+          </label>
+          <button type="submit"
+            class="w-full flex items-center justify-between gap-2 px-3 py-2 rounded-lg bg-emerald-600 text-white text-sm font-medium hover:bg-emerald-700">
+            <span>Tải lên &amp; phân tích</span>
+            <span id="upload-spinner" class="htmx-indicator">●</span>
+          </button>
+        </form>
+      </div>
+    </section>
+
+    <!-- Sidebar data refreshes itself whenever an import or merge happens -->
+    <div id="sidebar-data"
+         hx-get="/fragments/sidebar"
+         hx-trigger="edh:imported from:body, edh:merged from:body"
+         hx-swap="innerHTML">
+      {{template "sidebar_data" (dict "Stats" .Stats "Sources" .Sources)}}
+    </div>
+  </aside>
+
+  <!-- Main workspace -->
+  <main class="flex-1 min-w-0 p-6">
+    <div class="max-w-6xl mx-auto space-y-5">
+
+      <!-- Natural language search -->
+      <form
+        hx-get="/fragments/entities"
+        hx-target="#entity-table"
+        hx-swap="innerHTML"
+        hx-indicator="#search-spinner"
+        class="flex gap-2">
+        <div class="relative flex-1">
+          <input
+            type="search" name="q" placeholder='Hỏi bằng ngôn ngữ tự nhiên — ví dụ: "chuyên gia AI tham gia sự kiện năm 2025"'
+            class="w-full px-4 py-2.5 border border-gray-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-transparent">
+        </div>
+        <button type="submit"
+          class="inline-flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white px-5 py-2.5 rounded-xl text-sm font-semibold">
+          Tìm kiếm
+          <span id="search-spinner" class="htmx-indicator">●</span>
+        </button>
+      </form>
+
+      <!-- Merge review queue -->
+      <div id="merge-queue"
+           hx-get="/fragments/merges"
+           hx-trigger="edh:imported from:body"
+           hx-swap="innerHTML">
+        {{template "merge_list" (dict "Merges" .Merges)}}
+      </div>
+
+      <!-- Entity table -->
+      <div id="entity-table"
+           hx-get="/fragments/entities"
+           hx-trigger="edh:merged from:body, edh:imported from:body"
+           hx-swap="innerHTML">
+        {{template "entity_table" .Entities}}
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- HTMX swap targets for the drawer and modals -->
+<div id="drawer-host"></div>
+<div id="modal-host"></div>
+
+<script>
+  // Trivial UI polish only — all application logic is server-rendered.
+  document.body.addEventListener('click', function (e) {
+    if (e.target instanceof HTMLElement && e.target.dataset.close !== undefined) {
+      const host = document.getElementById(e.target.dataset.close);
+      if (host) host.innerHTML = '';
+    }
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') {
+      document.getElementById('drawer-host').innerHTML = '';
+      document.getElementById('modal-host').innerHTML = '';
+    }
+  });
+</script>
+</body>
+</html>{{end}}
