@@ -54,56 +54,18 @@ export function getEmbedClient(): GoogleGenAI {
   return _embedClient;
 }
 
-let _rateLimitUntil = 0;
-let _rateLimitLogged = false;
-
-export function isRateLimitCooldownActive(): boolean {
-  const active = Date.now() < _rateLimitUntil;
-  if (!active && _rateLimitLogged) {
-    _rateLimitLogged = false;
-  }
-  return active;
-}
-
-export function recordRateLimitCooldown(delayMs?: number, reason?: string): void {
-  const duration = delayMs && delayMs > 0 ? delayMs : 60_000;
-  _rateLimitUntil = Math.max(_rateLimitUntil, Date.now() + duration);
-  if (!_rateLimitLogged) {
-    console.info(
-      `[ai] Gemini rate limit / quota active (${reason ?? "RESOURCE_EXHAUSTED"}). Using heuristic fallbacks for the next ${Math.round(duration / 1000)}s.`,
-    );
-    _rateLimitLogged = true;
-  }
-}
-
 export function isAiConfigured(): boolean {
   return Boolean(config.gemini.apiKey) || (config.embeddings.useVertex && Boolean(config.embeddings.project));
 }
 
-const RETRYABLE = /\b(500|502|503|504|UNAVAILABLE|DEADLINE_EXCEEDED)\b/i;
-
-function isQuotaError(msg: string): boolean {
-  return /PerDay|PerProject|daily|limit:\s*\d+|quota exceeded|RESOURCE_EXHAUSTED|429/i.test(msg);
-}
-
-function extractRetryDelayMs(msg: string): number {
-  const match = msg.match(/(?:retry in|retryDelay["':\s]+)\s*(\d+(?:\.\d+)?)\s*s/i);
-  if (match && match[1]) {
-    return Math.ceil(parseFloat(match[1]) + 2) * 1000;
-  }
-  return 60_000;
-}
+const RETRYABLE = /\b(429|500|502|503|504|UNAVAILABLE|RESOURCE_EXHAUSTED|DEADLINE_EXCEEDED)\b/i;
 
 /**
  * Retries transient Google API failures with exponential backoff. Permanent
- * errors (400 bad model id, 401/403 bad key, daily quota exhaustion) fail fast
- * so the system can promptly use heuristic fallback.
+ * errors (400 bad model id, 401/403 bad key) are rethrown immediately — retrying
+ * those just makes a broken demo slower to diagnose.
  */
 export async function withRetry<T>(label: string, fn: () => Promise<T>, attempts = 3): Promise<T> {
-  if (isRateLimitCooldownActive()) {
-    throw new Error(`Rate limit cooldown active for ${label}; fallback active`);
-  }
-
   let lastErr: unknown;
   for (let i = 0; i < attempts; i++) {
     try {
@@ -111,11 +73,6 @@ export async function withRetry<T>(label: string, fn: () => Promise<T>, attempts
     } catch (err) {
       lastErr = err;
       const msg = err instanceof Error ? err.message : String(err);
-      if (isQuotaError(msg)) {
-        const delay = extractRetryDelayMs(msg);
-        recordRateLimitCooldown(delay, msg.slice(0, 100));
-        break;
-      }
       if (!RETRYABLE.test(msg) || i === attempts - 1) break;
       const delay = 400 * 2 ** i + Math.random() * 200;
       console.warn(`[ai] ${label} attempt ${i + 1} failed (${msg.slice(0, 120)}); retrying in ${Math.round(delay)}ms`);

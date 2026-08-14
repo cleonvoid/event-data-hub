@@ -23,7 +23,7 @@ export const SchemaMappingModal: React.FC<Props> = ({
 }) => {
   const [mapping, setMapping] = useState<Record<string, string>>(() =>
     Object.fromEntries(
-      (preview?.headers ?? []).map((h) => [h, preview?.mapping?.[h]?.canonical_field ?? "ignore"]),
+      preview.headers.map((h) => [h, preview.mapping[h]?.canonical_field ?? "ignore"]),
     ),
   );
 
@@ -80,9 +80,9 @@ export const SchemaMappingModal: React.FC<Props> = ({
 
         <div className="p-5 max-h-[55vh] overflow-y-auto">
           <div className="border border-gray-200 rounded-xl divide-y divide-gray-100">
-            {(preview?.headers ?? []).map((col, idx) => {
-              const proposal = preview?.mapping?.[col];
-              const sample = (preview?.sampleRows ?? []).find((r) => (r[idx] ?? "").trim() !== "")?.[idx];
+            {preview.headers.map((col, idx) => {
+              const proposal = preview.mapping[col];
+              const sample = preview.sampleRows.find((r) => (r[idx] ?? "").trim() !== "")?.[idx];
               return (
                 <div key={col} className="p-3.5 flex flex-col md:flex-row md:items-center gap-3">
                   <div className="md:w-1/3 min-w-0">

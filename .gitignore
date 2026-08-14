@@ -8,6 +8,11 @@ coverage/
 !.env.example
 .claude
 
+# Local Postgres data directories. docker-compose uses the named volume
+# pgdata18, so nothing here is load-bearing — but AI Studio's sandbox writes a
+# PGlite data dir to ./data and it must never be committed again.
+data/
+
 # Local spreadsheets used for testing imports. These carry attendee names,
 # emails and phone numbers, so they stay out of the repo by default. If a fixture
 # is genuinely synthetic and meant to be shared, add it explicitly:
