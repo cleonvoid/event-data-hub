@@ -6,3 +6,10 @@ coverage/
 *.log
 .env*
 !.env.example
+.claude
+
+# Local spreadsheets used for testing imports. These carry attendee names,
+# emails and phone numbers, so they stay out of the repo by default. If a fixture
+# is genuinely synthetic and meant to be shared, add it explicitly:
+#   git add -f test_data/files/<name>.xlsx
+test_data/

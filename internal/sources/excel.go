@@ -1,47 +1,101 @@
+// Package sources reads spreadsheets from local uploads, Google Drive and the
+// Google Sheets API into one common Grid shape.
 package sources
 
 import (
 	"fmt"
 	"io"
+	"strings"
 
-	"github.com/qax-os/excelize/v2"
+	"github.com/xuri/excelize/v2"
 )
 
-type ExcelSheetData struct {
-	SheetName string     `json:"sheet_name"`
-	Headers   []string   `json:"headers"`
-	Rows      [][]string `json:"rows"`
+// Grid is a parsed sheet: a header row plus rectangular data rows.
+type Grid struct {
+	Title   string
+	Headers []string
+	Rows    [][]string
+	// RowNumbers[i] is the 1-based line in the original sheet that Rows[i] came
+	// from. It is not i+2: GridFromRows drops fully blank rows, so a blank
+	// separator line partway down shifts every position after it. Reported to
+	// the user and stored on raw_records, so it has to point at the line they
+	// would actually find in the file.
+	RowNumbers []int
 }
 
-// ParseExcelReader parses an uploaded .xlsx file stream
-func ParseExcelReader(r io.Reader) (*ExcelSheetData, error) {
+// ParseSpreadsheet reads the first sheet of an .xlsx stream.
+func ParseSpreadsheet(r io.Reader) (*Grid, error) {
 	f, err := excelize.OpenReader(r)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse excel file: %w", err)
+		return nil, fmt.Errorf("không đọc được tệp bảng tính: %w", err)
 	}
-	defer f.Close()
+	// Nothing is written back, so a close failure cannot lose data.
+	defer func() { _ = f.Close() }()
 
 	sheets := f.GetSheetList()
 	if len(sheets) == 0 {
-		return nil, fmt.Errorf("excel file contains no sheets")
+		return nil, fmt.Errorf("tệp không chứa trang tính nào")
 	}
 
-	activeSheet := sheets[0]
-	rows, err := f.GetRows(activeSheet)
+	rows, err := f.GetRows(sheets[0])
 	if err != nil {
-		return nil, fmt.Errorf("failed to read sheet rows: %w", err)
+		return nil, fmt.Errorf("không đọc được dòng dữ liệu: %w", err)
 	}
+	return GridFromRows(sheets[0], rows), nil
+}
 
+// GridFromRows normalises a ragged row set into a rectangle and gives blank or
+// duplicate header cells stable synthetic names — both break a column→field
+// mapping keyed by header name.
+func GridFromRows(title string, rows [][]string) *Grid {
 	if len(rows) == 0 {
-		return &ExcelSheetData{SheetName: activeSheet, Headers: []string{}, Rows: [][]string{}}, nil
+		return &Grid{Title: title, Headers: []string{}, Rows: [][]string{}, RowNumbers: []int{}}
 	}
 
-	headers := rows[0]
-	dataRows := rows[1:]
+	width := len(rows[0])
+	for _, r := range rows {
+		if len(r) > width {
+			width = len(r)
+		}
+	}
 
-	return &ExcelSheetData{
-		SheetName: activeSheet,
-		Headers:   headers,
-		Rows:      dataRows,
-	}, nil
+	seen := map[string]int{}
+	headers := make([]string, width)
+	for i := 0; i < width; i++ {
+		name := ""
+		if i < len(rows[0]) {
+			name = strings.TrimSpace(rows[0][i])
+		}
+		if name == "" {
+			name = fmt.Sprintf("Cột %d", i+1)
+		}
+		count := seen[name]
+		seen[name] = count + 1
+		if count > 0 {
+			name = fmt.Sprintf("%s (%d)", name, count+1)
+		}
+		headers[i] = name
+	}
+
+	data := make([][]string, 0, len(rows)-1)
+	rowNumbers := make([]int, 0, len(rows)-1)
+	for offset, r := range rows[1:] {
+		padded := make([]string, width)
+		nonEmpty := false
+		for i := 0; i < width; i++ {
+			if i < len(r) {
+				padded[i] = r[i]
+				if strings.TrimSpace(r[i]) != "" {
+					nonEmpty = true
+				}
+			}
+		}
+		if nonEmpty {
+			data = append(data, padded)
+			// +2: the header occupies line 1 and offset is 0-based.
+			rowNumbers = append(rowNumbers, offset+2)
+		}
+	}
+
+	return &Grid{Title: title, Headers: headers, Rows: data, RowNumbers: rowNumbers}
 }
